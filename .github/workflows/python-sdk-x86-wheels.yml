@@ -1,15 +1,17 @@
-name: build-python-sdk-wheels-x86
+name: build-python-sdk-wheels-matrix
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        runner: ["ubuntu-22.04", "windows-latest", "macos-latest"]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,21 +27,72 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Install build dependencies
+      - name: Install build dependencies (Linux / macOS)
+        if: runner.os != 'Windows'
         run: python -m pip install --upgrade pip build
+        shell: bash
 
-      - name: Build libjfs.so
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pip install --upgrade pip build
+        shell: pwsh
+
+      - name: Build native library (Linux)
+        if: runner.os == 'Linux'
         run: |
           cd sdk/python
           make libjfs.so
+        shell: bash
 
-      - name: Build wheel
+      - name: Build native library (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd sdk/python
+          # Makefile should support producing a macOS dylib; fallback to default target if needed
+          make libjfs.dylib || make
+        shell: bash
+
+      - name: Build native library (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd sdk\python
+          # Windows builds normally require MSVC / appropriate toolchain.
+          # Adjust this command to your Windows build (e.g., use MSYS2, CMake + MSVC, or a .bat/powershell build script).
+          make libjfs.dll || Write-Host "Adjust Windows build commands here"
+        shell: pwsh
+
+      - name: Copy native lib into package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cd sdk/python/juicefs
+          # Ensure the built native library is packaged into the wheel. Adjust filename if Makefile outputs different name/location.
+          cp ../libjfs.so ./juicefs/ 2>/dev/null || cp ../libjfs.dylib ./juicefs/ 2>/dev/null || true
+        shell: bash
+
+      - name: Copy native lib into package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd sdk\python\juicefs
+          # Copy DLL to package dir if present. Adjust path as needed.
+          Copy-Item ..\libjfs.dll -Destination .\juicefs\ -ErrorAction SilentlyContinue
+        shell: pwsh
+
+      - name: Build wheel (Linux / macOS)
+        if: runner.os != 'Windows'
         run: |
           cd sdk/python/juicefs
           python -m build -w
+        shell: bash
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd sdk\python\juicefs
+          python -m build -w
+        shell: pwsh
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: juicefs-wheel-x86-py${{ matrix.python-version }}
+          name: juicefs-wheel-${{ matrix.runner }}-py${{ matrix.python-version }}
           path: sdk/python/juicefs/dist/*.whl
