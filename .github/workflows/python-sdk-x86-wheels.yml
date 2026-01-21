@@ -61,8 +61,10 @@ jobs:
           cd sdk\python
           $env:CGO_ENABLED=1
           $env:CC="gcc"
-          $env:CGO_CFLAGS="-I${env:ProgramFiles(x86)}\WinFsp\inc"
-          $env:CGO_LDFLAGS="-L${env:ProgramFiles(x86)}\WinFsp\lib"
+          $winfspRoot = "${env:ProgramFiles}\WinFsp"
+          if (!(Test-Path $winfspRoot)) { $winfspRoot = "${env:ProgramFiles(x86)}\WinFsp" }
+          $env:CGO_CFLAGS="-I`"$winfspRoot\inc`""
+          $env:CGO_LDFLAGS="-L`"$winfspRoot\lib\x86`" -lwinfsp"
           go build -buildmode=c-shared -ldflags="-s -w" -o juicefs/juicefs/libjfs.dll ../java/libjfs
         shell: pwsh
       - name: Copy native lib into package (Linux / macOS)
