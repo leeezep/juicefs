@@ -1,4 +1,4 @@
-name: build-arm64
+name: build-python-sdk-wheels-arm64
 
 on:
   workflow_dispatch:
@@ -30,26 +30,22 @@ jobs:
         run: python -m pip install --upgrade pip build
         shell: bash
 
-      - name: Build native library
+      - name: Build native library (libjfs.so)
         run: |
           cd sdk/python
-          make libjfs.so
-        shell: bash
-
-      - name: Copy native lib into package
-        run: |
-          cd sdk/python/juicefs
-          cp juicefs/libjfs.so ./juicefs/
+          go build -buildmode c-shared -ldflags="-s -w" -o juicefs/juicefs/libjfs.so ../java/libjfs
+          ls -al juicefs/juicefs | sed -n '1,200p'
         shell: bash
 
       - name: Build wheel
         run: |
           cd sdk/python/juicefs
           python -m build -w
+          ls -al dist | sed -n '1,200p'
         shell: bash
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: juicefs-wheel-ubuntu-arm64-py${{ matrix.python-version }}
+          name: juicefs-wheel-linux-arm64-py${{ matrix.python-version }}
           path: sdk/python/juicefs/dist/*.whl
