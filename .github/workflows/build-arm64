@@ -1,4 +1,4 @@
-name: build-python-sdk-wheels-matrix
+name: build-arm64
 
 on:
   workflow_dispatch:
