@@ -9,7 +9,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ["ubuntu-22.04", "windows-latest", "macos-latest"]
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+          - runner: macos-latest
+            arch: arm64
         python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
@@ -27,19 +33,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Install build dependencies (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Install build dependencies
         run: python -m pip install --upgrade pip build
         shell: bash
 
-      - name: Install build dependencies (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          choco install winfsp -y
-          choco install mingw -y
-          echo "C:\ProgramData\mingw64\mingw64\bin" >> $env:GITHUB_PATH
-          python -m pip install --upgrade pip build
-        shell: pwsh
       - name: Build native library (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -55,49 +52,29 @@ jobs:
           make libjfs.dylib || make
         shell: bash
 
-      - name: Build native library (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd sdk\python
-          $env:CGO_ENABLED=1
-          $env:CC="gcc"
-          $winfspRoot = "${env:ProgramFiles}\WinFsp"
-          if (!(Test-Path $winfspRoot)) { $winfspRoot = "${env:ProgramFiles(x86)}\WinFsp" }
-          $env:CGO_CFLAGS="-I`"$winfspRoot\inc`""
-          $env:CGO_LDFLAGS="-L`"$winfspRoot\lib\x86`" -lwinfsp"
-          go build -buildmode=c-shared -ldflags="-s -w" -o juicefs/juicefs/libjfs.dll ../java/libjfs
-        shell: pwsh
-      - name: Copy native lib into package (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Copy native lib into package
         run: |
           cd sdk/python/juicefs
           # Ensure the built native library is packaged into the wheel. Adjust filename if Makefile outputs different name/location.
           cp ../libjfs.so ./juicefs/ 2>/dev/null || cp ../libjfs.dylib ./juicefs/ 2>/dev/null || true
         shell: bash
 
-      - name: Copy native lib into package (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd sdk\python\juicefs
-          # The DLL is built directly into the package dir; keep this step for safety.
-          Copy-Item .\juicefs\libjfs.dll -Destination .\juicefs\ -ErrorAction SilentlyContinue
-        shell: pwsh
-      - name: Build wheel (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Build wheel
         run: |
           cd sdk/python/juicefs
           python -m build -w
         shell: bash
 
-      - name: Build wheel (Windows)
-        if: runner.os == 'Windows'
+      - name: Add architecture suffix to wheel filename
         run: |
-          cd sdk\python\juicefs
-          python -m build -w
-        shell: pwsh
+          cd sdk/python/juicefs/dist
+          for wheel in *.whl; do
+            mv "$wheel" "${wheel%.whl}_${{ matrix.arch }}.whl"
+          done
+        shell: bash
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: juicefs-wheel-${{ matrix.runner }}-py${{ matrix.python-version }}
+          name: juicefs-wheel-${{ matrix.runner }}-${{ matrix.arch }}-py${{ matrix.python-version }}
           path: sdk/python/juicefs/dist/*.whl
