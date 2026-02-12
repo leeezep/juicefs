@@ -39,7 +39,7 @@ jobs:
       - name: Copy native lib into package
         run: |
           cd sdk/python/juicefs
-          cp ../libjfs.so ./juicefs/
+          cp juicefs/libjfs.so ./juicefs/
         shell: bash
 
       - name: Build wheel
