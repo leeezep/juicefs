@@ -9,6 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         include:
           - runner: ubuntu-22.04
             arch: x86_64
@@ -16,7 +18,6 @@ jobs:
             arch: arm64
           - runner: macos-latest
             arch: arm64
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout
@@ -37,9 +38,11 @@ jobs:
         run: python -m pip install --upgrade pip build
         shell: bash
 
+      # ---- Build native lib ----
       - name: Build native library (Linux)
         if: runner.os == 'Linux'
         run: |
+          set -euxo pipefail
           cd sdk/python
           make libjfs.so
         shell: bash
@@ -47,30 +50,37 @@ jobs:
       - name: Build native library (macOS)
         if: runner.os == 'macOS'
         run: |
+          set -euxo pipefail
           cd sdk/python
-          # Makefile should support producing a macOS dylib; fallback to default target if needed
-          make libjfs.dylib || make
+          make libjfs.dylib
         shell: bash
 
+      # ---- Copy native lib into python package ----
       - name: Copy native lib into package
         run: |
-          cd sdk/python/juicefs
-          # Ensure the built native library is packaged into the wheel. Adjust filename if Makefile outputs different name/location.
-          cp ../libjfs.so ./juicefs/ 2>/dev/null || cp ../libjfs.dylib ./juicefs/ 2>/dev/null || true
+          set -euxo pipefail
+
+          # package root
+          PKG_DIR="sdk/python/juicefs/juicefs"
+
+          mkdir -p "${PKG_DIR}"
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            install -m 0644 sdk/python/libjfs.so "${PKG_DIR}/libjfs.so"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            install -m 0644 sdk/python/libjfs.dylib "${PKG_DIR}/libjfs.dylib"
+          else
+            echo "Unsupported OS: ${{ runner.os }}"
+            exit 1
+          fi
         shell: bash
 
       - name: Build wheel
         run: |
+          set -euxo pipefail
           cd sdk/python/juicefs
           python -m build -w
-        shell: bash
-
-      - name: Add architecture suffix to wheel filename
-        run: |
-          cd sdk/python/juicefs/dist
-          for wheel in *.whl; do
-            mv "$wheel" "${wheel%.whl}_${{ matrix.arch }}.whl"
-          done
+          ls -al dist
         shell: bash
 
       - name: Upload wheel
