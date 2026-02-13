@@ -1,0 +1,51 @@
+name: build-python-sdk-wheels-linux-x86
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip build
+        shell: bash
+
+      - name: Build native library (libjfs.so)
+        run: |
+          cd sdk/python
+          go build -buildmode c-shared -ldflags="-s -w" -o juicefs/juicefs/libjfs.so ../java/libjfs
+          ls -al juicefs/juicefs | sed -n '1,200p'
+        shell: bash
+
+      - name: Build wheel
+        run: |
+          cd sdk/python/juicefs
+          python -m build -w
+          ls -al dist | sed -n '1,200p'
+        shell: bash
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: juicefs-wheel-linux-x86_64-py${{ matrix.python-version }}
+          path: sdk/python/juicefs/dist/*.whl
