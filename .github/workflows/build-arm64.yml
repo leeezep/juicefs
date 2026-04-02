@@ -6,10 +6,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11"]
 
     steps:
       - name: Checkout
@@ -23,7 +19,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
           allow-prereleases: true
 
       - name: Install build dependencies
@@ -47,5 +43,5 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: juicefs-wheel-linux-arm64-py${{ matrix.python-version }}
+          name: juicefs-wheel-linux-arm64-py311
           path: sdk/python/juicefs/dist/*.whl
