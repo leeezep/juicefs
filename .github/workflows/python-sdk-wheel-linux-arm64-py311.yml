@@ -1,4 +1,4 @@
-name: build-python-sdk-wheels-arm64
+name: python-sdk-wheel-linux-arm64-py311
 
 on:
   workflow_dispatch:
