@@ -21,6 +21,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"strings"
 	gosync "sync"
 	"testing"
 	"time"
@@ -482,6 +483,51 @@ func TestRestoreListDonePrefix(t *testing.T) {
 	}
 }
 
+func TestSyncCheckpointForceResetStartsFresh(t *testing.T) {
+	src, _ := object.CreateStorage("mem", "force-reset-src", "", "", "")
+	dst, _ := object.CreateStorage("mem", "force-reset-dst", "", "", "")
+
+	putObjects(t, src, "dir/a", "dir/b", "dir/sub/x", "dir/sub/pending")
+	pendingObj, err := src.Head(ctx, "dir/sub/pending")
+	if err != nil {
+		t.Fatalf("head pending object: %v", err)
+	}
+
+	seedConfig := newTestConfig()
+	mgr := NewCheckpointManager(src, dst, seedConfig)
+	ckpt := &Checkpoint{
+		PrefixState: map[string]*PrefixState{
+			"dir/": {
+				ListDone:    true,
+				ListDepth:   2,
+				PendingKeys: make(map[string]object.Object),
+				FailedKeys:  make(map[string]object.Object),
+			},
+			"dir/sub/": {
+				ListDone:    true,
+				ListDepth:   1,
+				PendingKeys: map[string]object.Object{"dir/sub/pending": pendingObj},
+				FailedKeys:  make(map[string]object.Object),
+			},
+		},
+		Config: seedConfig,
+	}
+	if err := mgr.Save(ckpt); err != nil {
+		t.Fatalf("save checkpoint: %v", err)
+	}
+
+	config := newTestConfig()
+	config.CheckpointForceReset = true
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("Sync with checkpoint force reset: %v", err)
+	}
+
+	assertDstHasKeys(t, dst, "dir/a", "dir/b", "dir/sub/x", "dir/sub/pending")
+	if _, err := dst.Head(ctx, generateCheckpointKey(src.String(), dst.String(), config)); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint file should be removed after successful force-reset sync, got err=%v", err)
+	}
+}
+
 // TestProduceFromListOverlappingPrefixes verifies that when files-from contains
 // both "dir/" and "dir/sub/", and both are in checkpoint, each is restored exactly once.
 func TestProduceFromListOverlappingPrefixes(t *testing.T) {
@@ -509,4 +555,38 @@ func TestProduceFromListOverlappingPrefixes(t *testing.T) {
 	}
 
 	assertDstHasKeys(t, dst, "dir/sub/y", "dir/sub/pending")
+}
+
+func TestCheckpointPlacedAtParentForFileDst(t *testing.T) {
+	src, _ := object.CreateStorage("mem", "src", "", "", "")
+	base, _ := object.CreateStorage("mem", "base", "", "", "")
+	fileDst := object.WithPrefix(base, "subdir/target")
+
+	mgr := NewCheckpointManager(src, fileDst, nil)
+
+	if strings.HasPrefix(mgr.checkpointKey, "/") {
+		t.Errorf("checkpoint key should not start with '/': %q", mgr.checkpointKey)
+	}
+	if !strings.HasSuffix(mgr.dst.String(), "/") {
+		t.Errorf("checkpointMgr.dst should be a directory (end with /): %q", mgr.dst.String())
+	}
+
+	ckpt := &Checkpoint{PrefixState: make(map[string]*PrefixState)}
+	if err := mgr.Save(ckpt); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loader := NewCheckpointManager(src, fileDst, nil)
+	if _, err := loader.Load(); err != nil {
+		t.Errorf("Load via file-like dst should succeed: %v", err)
+	}
+
+	expectedBaseKey := "subdir/" + mgr.checkpointKey
+	if _, err := base.Head(ctx, expectedBaseKey); err != nil {
+		t.Errorf("checkpoint not found at expected base path %q: %v", expectedBaseKey, err)
+	}
+	wrongBaseKey := "subdir/target" + mgr.checkpointKey
+	if _, err := base.Head(ctx, wrongBaseKey); err == nil {
+		t.Errorf("checkpoint should NOT exist at wrong path %q", wrongBaseKey)
+	}
 }

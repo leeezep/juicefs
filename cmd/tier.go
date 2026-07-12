@@ -39,10 +39,12 @@ func cmdTier() *cli.Command {
 		Description: `
 Examples:
 $ juicefs tier list redis://localhost
-$ juicefs tier set redis://localhost --id 1 /dir1
-$ juicefs tier set redis://localhost --id 2 /dir1 -r
-$ juicefs tier set redis://localhost --id 3 /file1
-$ juicefs tier set redis://localhost --id 0 /file1
+$ juicefs tier set redis://localhost --tier 1 /dir1
+$ juicefs tier set redis://localhost --tier 2 /dir1 -r
+$ juicefs tier set redis://localhost --tier 3 /file1
+$ juicefs tier set redis://localhost --tier 0 /file1
+$ juicefs tier restore redis://localhost /file1
+$ juicefs tier restore redis://localhost /file1 --days 7
 $ juicefs tier restore redis://localhost /dir1`,
 		Subcommands: []*cli.Command{
 			{
@@ -66,14 +68,14 @@ $ juicefs tier restore redis://localhost /dir1`,
 		},
 		Flags: []cli.Flag{
 			&cli.IntFlag{
-				Name:  "id",
-				Usage: "tier id (0-3, 0 is reserved for default tier)",
+				Name:  "tier",
+				Usage: "tier (0-3, 0 is reserved for default tier)",
 				Action: func(ctx *cli.Context, v int) error {
-					if !ctx.IsSet("id") {
+					if !ctx.IsSet("tier") {
 						return nil
 					}
 					if v < 0 || v > 3 {
-						return fmt.Errorf("-id should be between 0 and 3")
+						return fmt.Errorf("--tier should be between 0 and 3")
 					}
 					return nil
 				},
@@ -86,7 +88,21 @@ $ juicefs tier restore redis://localhost /dir1`,
 			&cli.BoolFlag{
 				Name:    "force",
 				Aliases: []string{"f"},
-				Usage:   "force rewriting objects to the tier's current storage class (useful after --tier-sc config changes), even when the tier id is unchanged",
+				Usage:   "force rewriting objects to the tier's current storage class (useful after --storage-class config changes), even when the tier id is unchanged",
+			},
+			&cli.IntFlag{
+				Name:  "days",
+				Value: object.DefaultRestoreDays,
+				Usage: "the duration within which the restored object remains in the restored state",
+				Action: func(ctx *cli.Context, v int) error {
+					if !ctx.IsSet("days") {
+						return nil
+					}
+					if v < 1 {
+						return fmt.Errorf("--days should be at least 1")
+					}
+					return nil
+				},
 			},
 		},
 	}
@@ -101,9 +117,9 @@ func listTier(ctx *cli.Context) error {
 		logger.Fatalf("load setting: %s", err)
 	}
 	results := make([][]string, 0, 1+len(format.Tiers))
-	results = append(results, []string{"id", "storageClass"})
+	results = append(results, []string{"tier", "storageClass", "tag"})
 	for id, t := range format.Tiers {
-		results = append(results, []string{fmt.Sprintf("%d", id), t.GetHumanSc()})
+		results = append(results, []string{fmt.Sprintf("%d", id), t.Sc, t.Tag})
 	}
 	dataRows := results[1:]
 	sort.Slice(dataRows, func(i, j int) bool {
@@ -118,19 +134,20 @@ func setTier(ctx *cli.Context) error {
 	setup(ctx, 2)
 	removePassword(ctx.Args().Get(0))
 	path := ctx.Args().Get(1)
-	if !ctx.IsSet("id") {
-		logger.Fatal("missing required flag: -id")
+	if !ctx.IsSet("tier") {
+		logger.Fatal("missing required flag: --tier")
 	}
-	id := ctx.Uint("id")
+	id := ctx.Uint("tier")
 	m := meta.NewClient(ctx.Args().Get(0), nil)
 	format, err := m.Load(true)
 	if err != nil {
 		logger.Fatalf("load setting: %s", err)
 	}
-	newTier := format.Tiers[uint8(id)]
-	if id != 0 && newTier.Sc == "" {
-		logger.Fatalf("storage tier %d is not defined in the format", id)
+	newTier, ok := format.Tiers[uint8(id)]
+	if !ok {
+		logger.Fatalf("unknown tier %d", id)
 	}
+	newTier.ID = uint8(id)
 	var ino meta.Ino
 	var attr meta.Attr
 	eno := m.Resolve(meta.Background(), meta.RootInode, path, &ino, &attr, true)
@@ -145,7 +162,7 @@ func setTier(ctx *cli.Context) error {
 		logger.Fatal("only file and directory are supported to set storage tier")
 	}
 	oldTier := format.Tiers[attr.Tier]
-	logger.Infof("set storage tier of %q from %d(%s) to %d(%s)", path, attr.Tier, oldTier.GetHumanSc(), id, newTier.GetHumanSc())
+	logger.Infof("set storage tier of %q from %d(storage-class: %s;tag: %s) to %d(storage-class: %s;tag: %s)", path, attr.Tier, oldTier.Sc, oldTier.Tag, id, newTier.Sc, newTier.Tag)
 	blob, err := createStorage(*format)
 	if err != nil {
 		logger.Fatalf("object storage: %s", err)
@@ -159,13 +176,21 @@ func setTier(ctx *cli.Context) error {
 	}
 
 	objectFunc := func(key string) error {
+		if !ctx.Bool("force") {
+			if head, err := blob.Head(context.Background(), key); err == nil {
+				if newTier.Sc == head.StorageClass() {
+					return nil
+				}
+			}
+		}
+
 		fullPath := format.Name + "/" + key
 		ctx := context.WithValue(context.Background(), object.TierKey{}, uint8(id))
 		return blob.Copy(ctx, fullPath, fullPath)
 	}
-	checkFunc := func(oriTier uint8) bool {
+	checkFunc := func(ino meta.Ino, oriTier uint8) bool {
 		if id == uint(oriTier) && !ctx.Bool("force") {
-			logger.Debugf("storage tier is already %d, no change needed", oriTier)
+			logger.Debugf("inode:%d storage tier is already %d, no change needed", ino, oriTier)
 			return true
 		}
 		return false
@@ -180,7 +205,7 @@ func setTier(ctx *cli.Context) error {
 			}
 		}
 		if err = metaFunc(ino); err != nil {
-			return err
+			return fmt.Errorf("set tier for inode %d tier:%d failed: %w", ino, newTier.ID, err)
 		}
 
 	default:
@@ -193,6 +218,7 @@ func objRestore(ctx *cli.Context) error {
 	setup(ctx, 2)
 	removePassword(ctx.Args().Get(0))
 	path := ctx.Args().Get(1)
+	days := ctx.Int("days")
 	m := meta.NewClient(ctx.Args().Get(0), nil)
 	format, err := m.Load(true)
 	if err != nil {
@@ -217,7 +243,7 @@ func objRestore(ctx *cli.Context) error {
 	}
 
 	objectFunc := func(key string) error {
-		return blob.Restore(context.Background(), key)
+		return blob.Restore(context.Background(), key, int32(days))
 	}
 	if attr.Typ == meta.TypeFile {
 		err = visitEntry(m, format, ino, attr, objectFunc, nil, nil)
@@ -228,7 +254,7 @@ func objRestore(ctx *cli.Context) error {
 	return err
 }
 
-func visitDir(m meta.Meta, format *meta.Format, ino meta.Ino, recursive bool, objectFunc func(key string) error, metaFunc func(ino meta.Ino) error, checkFunc func(oriTier uint8) bool) error {
+func visitDir(m meta.Meta, format *meta.Format, ino meta.Ino, recursive bool, objectFunc func(key string) error, metaFunc func(ino meta.Ino) error, checkFunc func(ino meta.Ino, oriTier uint8) bool) error {
 	handler, errno := m.NewDirHandler(meta.Background(), ino, true, nil)
 	if errno != 0 {
 		return errno
@@ -287,22 +313,25 @@ func getObjKeys(m meta.Meta, format *meta.Format, ino meta.Ino, length uint64) [
 	}
 	return objs
 }
-func visitEntry(m meta.Meta, format *meta.Format, ino meta.Ino, attr meta.Attr, objectFunc func(key string) error, metaFunc func(ino meta.Ino) error, checkFunc func(oriTier uint8) bool) error {
-	if checkFunc != nil && checkFunc(attr.Tier) {
+func visitEntry(m meta.Meta, format *meta.Format, ino meta.Ino, attr meta.Attr, objectFunc func(key string) error, metaFunc func(ino meta.Ino) error, checkFunc func(ino meta.Ino, oriTier uint8) bool) error {
+	if checkFunc != nil && checkFunc(ino, attr.Tier) {
 		return nil
 	}
 	objs := getObjKeys(m, format, ino, attr.Length)
 	if objectFunc != nil {
-		for _, obj := range objs {
-			err := objectFunc(obj)
-			if err != nil {
-				logger.Errorf("apply objectFunc failed %s: %s", obj, err)
-				return err
+		for _, key := range objs {
+			if key != "" {
+				err := objectFunc(key)
+				if err != nil {
+					return fmt.Errorf("apply object action failed in inode:%d key:%v: err:%s", ino, key, err)
+				}
 			}
 		}
 	}
 	if metaFunc != nil {
-		return metaFunc(ino)
+		if err := metaFunc(ino); err != nil {
+			return fmt.Errorf("set tier for inode %d failed: %w", ino, err)
+		}
 	}
 	return nil
 }

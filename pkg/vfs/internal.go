@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	io_prometheus_client "github.com/prometheus/client_model/go"
@@ -259,8 +260,7 @@ type InfoResponse struct {
 	Objects       []*chunkObj
 	PLocks        []meta.PLockItem
 	FLocks        []meta.FLockItem
-	TierID        uint8
-	TierStr       string
+	Tier          object.Tier
 	RestoreStatus string
 }
 
@@ -449,21 +449,20 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		} else {
 			var attr meta.Attr
 			eno := v.Meta.GetAttr(ctx, inode, &attr)
+			info.Tier = object.Tier{}
 			if eno != 0 {
 				logger.Warnf("GetAttr of %d: %s", inode, eno)
-				info.TierID = 0
-				info.TierStr = "unknown"
+				info.Tier.ID = 0
+				info.Tier.Sc = "unknown"
 			} else {
-				info.TierID = attr.Tier
-				if info.TierID == 0 {
-					info.TierStr = "default"
+				if t, ok := v.Meta.GetFormat().Tiers[attr.Tier]; ok {
+					info.Tier.ID = t.ID
+					info.Tier.Sc = t.Sc
+					info.Tier.Tag = t.Tag
 				} else {
-					if t, ok := v.Meta.GetFormat().Tiers.GetSc(attr.Tier); ok {
-						info.TierStr = t
-					} else {
-						logger.Warnf("unknown storage class id %d of inode %d", attr.Tier, inode)
-						info.TierStr = "unknown"
-					}
+					logger.Warnf("unknown tier id %d of inode %d", attr.Tier, inode)
+					info.Tier.Sc = "unknown"
+					info.Tier.ID = attr.Tier
 				}
 			}
 			info.Paths = v.Meta.GetPaths(ctx, inode)
@@ -483,16 +482,25 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 				}
 			}
 			if len(info.Objects) > 0 {
-				lastObjKey := strings.TrimPrefix(info.Objects[len(info.Objects)-1].Key, v.Conf.Format.Name+"/")
-				if objInfo, err := v.Store.BlobStorage().Head(context.Background(), lastObjKey); err != nil {
-					logger.Warnf("get restore status of %s: %s", lastObjKey, err)
-				} else {
-					info.RestoreStatus = objInfo.Status()
-					if info.TierID != 0 && objInfo.StorageClass() != info.TierStr {
-						info.TierStr = fmt.Sprintf("expected(%s),actual(%s)", info.TierStr, objInfo.StorageClass())
+				var lastObjKey string
+				for i := len(info.Objects) - 1; i >= 0; i-- {
+					if info.Objects[i].Key != "" {
+						lastObjKey = strings.TrimPrefix(info.Objects[i].Key, v.Conf.Format.Name+"/")
+						break
 					}
-					if info.TierID == 0 {
-						info.TierStr = fmt.Sprintf("actual(%s)", objInfo.StorageClass())
+				}
+				if lastObjKey != "" {
+					if objInfo, err := v.Store.BlobStorage().Head(context.Background(), lastObjKey); err == nil {
+						info.RestoreStatus = objInfo.Status()
+						if info.Tier.ID != 0 && objInfo.StorageClass() != info.Tier.Sc ||
+							(info.Tier.ID == 0 && info.Tier.Sc != "" && objInfo.StorageClass() != info.Tier.Sc) {
+							info.Tier.Sc = fmt.Sprintf("expected(%s),actual(%s)", info.Tier.Sc, objInfo.StorageClass())
+						}
+						if info.Tier.ID == 0 && info.Tier.Sc == "" {
+							info.Tier.Sc = fmt.Sprintf("actual(%s)", objInfo.StorageClass())
+						}
+					} else {
+						logger.Warnf("Failed to get object info by Head for key %q (get restore status): %v", lastObjKey, err)
 					}
 				}
 			}

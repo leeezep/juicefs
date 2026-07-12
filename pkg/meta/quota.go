@@ -167,6 +167,13 @@ func (m *baseMeta) GetDirStat(ctx Context, inode Ino) (stat *dirStat, st syscall
 	}
 	if stat == nil {
 		stat, st = m.calcDirStat(ctx, inode)
+	} else {
+		m.dirStatsLock.RLock()
+		pending := m.dirStats[inode]
+		m.dirStatsLock.RUnlock()
+		stat.length += pending.length
+		stat.space += pending.space
+		stat.inodes += pending.inodes
 	}
 	return
 }
@@ -262,8 +269,8 @@ func (m *baseMeta) doFlushStats() {
 	m.fsStatsLock.Unlock()
 }
 
-func (m *baseMeta) syncVolumeStat(ctx Context) error {
-	return m.en.doSyncVolumeStat(ctx)
+func (m *baseMeta) syncVolumeStat(ctx Context, used, inodes int64) error {
+	return m.en.doSyncVolumeStat(ctx, used, inodes)
 }
 
 func (m *baseMeta) checkQuota(ctx Context, space, inodes int64, uid, gid uint32, parents ...Ino) syscall.Errno {
@@ -300,6 +307,8 @@ func (m *baseMeta) loadQuotas() {
 	if !format.DirStats && !format.UserGroupQuota {
 		return
 	}
+	m.quotasFlushLock.Lock()
+	defer m.quotasFlushLock.Unlock()
 
 	dirQuotas, userQuotas, groupQuotas, err := m.en.doLoadQuotas(Background())
 	if err != nil {
@@ -462,36 +471,32 @@ func (m *baseMeta) updateUserGroupStat(ctx Context, uid, gid uint32, space, inod
 	if !m.getFormat().UserGroupQuota {
 		return
 	}
-	if (uid == 0 && gid == 0) || (space == 0 && inodes == 0) {
+	if space == 0 && inodes == 0 {
 		return
 	}
 	m.quotaMu.Lock()
-	if uid > 0 {
-		if uq := m.userQuotas[uint64(uid)]; uq != nil {
-			uq.update(space, inodes)
-		} else {
-			m.userQuotas[uint64(uid)] = &Quota{
-				UsedSpace:  0,
-				UsedInodes: 0,
-				MaxSpace:   -1, // No limit
-				MaxInodes:  -1,
-				newSpace:   space,
-				newInodes:  inodes,
-			}
+	if uq := m.userQuotas[uint64(uid)]; uq != nil {
+		uq.update(space, inodes)
+	} else {
+		m.userQuotas[uint64(uid)] = &Quota{
+			UsedSpace:  0,
+			UsedInodes: 0,
+			MaxSpace:   -1, // No limit
+			MaxInodes:  -1,
+			newSpace:   space,
+			newInodes:  inodes,
 		}
 	}
-	if gid > 0 {
-		if gq := m.groupQuotas[uint64(gid)]; gq != nil {
-			gq.update(space, inodes)
-		} else {
-			m.groupQuotas[uint64(gid)] = &Quota{
-				UsedSpace:  0,
-				UsedInodes: 0,
-				MaxSpace:   -1, // No limit
-				MaxInodes:  -1,
-				newSpace:   space,
-				newInodes:  inodes,
-			}
+	if gq := m.groupQuotas[uint64(gid)]; gq != nil {
+		gq.update(space, inodes)
+	} else {
+		m.groupQuotas[uint64(gid)] = &Quota{
+			UsedSpace:  0,
+			UsedInodes: 0,
+			MaxSpace:   -1, // No limit
+			MaxInodes:  -1,
+			newSpace:   space,
+			newInodes:  inodes,
 		}
 	}
 	m.quotaMu.Unlock()
@@ -538,6 +543,8 @@ func (m *baseMeta) doFlushQuotas() {
 	if !m.getFormat().DirStats && !m.getFormat().UserGroupQuota {
 		return
 	}
+	m.quotasFlushLock.Lock()
+	defer m.quotasFlushLock.Unlock()
 
 	var allQuotas []*iQuota
 	m.quotaMu.RLock()
@@ -658,38 +665,33 @@ func (m *baseMeta) handleQuotaSet(ctx Context, qtype uint32, key uint64, dpath s
 	if err != nil {
 		return err
 	}
-	if !created {
+	if created && qtype == DirQuotaType {
+		return m.calcDirQuotaUsage(ctx, Ino(key), dpath, strict)
+	} else if scan && (qtype == UserQuotaType || qtype == GroupQuotaType) {
+		return m.ScanUserGroupUsage(ctx)
+	} else {
 		return nil
 	}
-	return m.initializeQuotaUsage(ctx, qtype, key, dpath, strict, scan)
 }
 
-func (m *baseMeta) initializeQuotaUsage(ctx Context, qtype uint32, key uint64, dpath string, strict bool, scan bool) error {
-	switch qtype {
-	case DirQuotaType:
-		wrapErr := func(e error) error {
-			return errors.Wrapf(e, "set quota usage for file(%s), please repair it later", dpath)
-		}
+func (m *baseMeta) calcDirQuotaUsage(ctx Context, ino Ino, dpath string, strict bool) error {
+	wrapErr := func(e error) error {
+		return errors.Wrapf(e, "set quota usage for file(%s), please repair it later", dpath)
+	}
 
-		var sum Summary
-		if st := m.GetSummary(ctx, Ino(key), &sum, true, strict); st != 0 {
-			return wrapErr(st)
-		}
+	var sum Summary
+	if st := m.GetSummary(ctx, ino, &sum, true, strict); st != 0 {
+		return wrapErr(st)
+	}
 
-		_, err := m.en.doSetQuota(ctx, DirQuotaType, key, &Quota{
-			UsedSpace:  int64(sum.Size) - align4K(0),
-			UsedInodes: int64(sum.Dirs+sum.Files) - 1,
-			MaxSpace:   -1,
-			MaxInodes:  -1,
-		})
-		if err != nil {
-			return wrapErr(err)
-		}
-		return nil
-	case UserQuotaType, GroupQuotaType:
-		if scan {
-			return m.ScanUserGroupUsage(ctx)
-		}
+	_, err := m.en.doSetQuota(ctx, DirQuotaType, uint64(ino), &Quota{
+		UsedSpace:  int64(sum.Size) - align4K(0),
+		UsedInodes: int64(sum.Dirs+sum.Files) - 1,
+		MaxSpace:   -1,
+		MaxInodes:  -1,
+	})
+	if err != nil {
+		return wrapErr(err)
 	}
 	return nil
 }
@@ -795,9 +797,6 @@ func (m *baseMeta) scanGlobalUserGroupUsage(ctx Context) (map[uint64]*Summary, m
 			}
 
 			uid, gid := uint64(e.Attr.Uid), uint64(e.Attr.Gid)
-			if (uid == 0 || gid == 0) && e.Attr.Typ == TypeFile {
-				continue
-			}
 
 			if userUsage[uid] == nil {
 				userUsage[uid] = &Summary{}
@@ -839,6 +838,25 @@ func (m *baseMeta) scanGlobalUserGroupUsage(ctx Context) (map[uint64]*Summary, m
 
 		}
 	}
+
+	if err := m.en.doScanSustainedInodes(ctx, func(uid, gid uint32, length uint64) error {
+		u, g := uint64(uid), uint64(gid)
+		if userUsage[u] == nil {
+			userUsage[u] = &Summary{}
+		}
+		if groupUsage[g] == nil {
+			groupUsage[g] = &Summary{}
+		}
+		space := align4K(length)
+		userUsage[u].Size += uint64(space)
+		userUsage[u].Files++
+		groupUsage[g].Size += uint64(space)
+		groupUsage[g].Files++
+		return nil
+	}); err != nil {
+		logger.Warnf("scan sustained inodes for user/group quota: %v", err)
+	}
+
 	return userUsage, groupUsage, nil
 }
 
@@ -960,9 +978,6 @@ func (m *baseMeta) compareUGUsage(usageMap map[uint64]*Summary, quotaMap map[uin
 		idType = "gid"
 	}
 	for id, usage := range usageMap {
-		if id == 0 {
-			continue
-		}
 		usedSpace := int64(usage.Size)
 		usedInodes := int64(usage.Files)
 		q, ok := quotaMap[id]
@@ -983,9 +998,6 @@ func (m *baseMeta) compareUGUsage(usageMap map[uint64]*Summary, quotaMap map[uin
 		retQuotas[fmt.Sprintf("%d", id)] = q
 	}
 	for id, q := range quotaMap {
-		if id == 0 {
-			continue
-		}
 		if _, ok := usageMap[id]; ok {
 			continue
 		}
@@ -1000,9 +1012,6 @@ func (m *baseMeta) compareUGUsage(usageMap map[uint64]*Summary, quotaMap map[uin
 
 func (m *baseMeta) repairUsage(ctx Context, usageMap map[uint64]*Summary, quotaMap map[uint64]*Quota, qtype uint32) error {
 	for id, usage := range usageMap {
-		if id == 0 {
-			continue
-		}
 		quota := &Quota{
 			MaxSpace:   -1,
 			MaxInodes:  -1,

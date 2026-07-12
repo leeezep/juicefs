@@ -266,7 +266,7 @@ func (s *wSlice) SetWriteback(enabled bool) {
 
 func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 	if int(off)+len(p) > chunkSize {
-		return 0, fmt.Errorf("write out of chunk boudary: %d > %d", int(off)+len(p), chunkSize)
+		return 0, fmt.Errorf("write out of chunk boundary: %d > %d", int(off)+len(p), chunkSize)
 	}
 	if off < int64(s.uploaded) {
 		return 0, fmt.Errorf("Cannot overwrite uploaded block: %d < %d", off, s.uploaded)
@@ -573,7 +573,7 @@ func (c *Config) SelfCheck(uuid string) {
 		c.MaxUpload = 1
 	}
 	if c.UploadLimit > 0 && int64(c.MaxUpload*c.BlockSize) > c.UploadLimit*int64(c.GetTimeout/time.Second)/2 {
-		logger.Warnf("max-upload %d may exceed bandwidth limit (bw: %d Mbps)", c.MaxUpload, c.UploadDelay*8>>20)
+		logger.Warnf("max-upload %d may exceed bandwidth limit (bw: %d Mbps)", c.MaxUpload, (c.UploadLimit*8)>>20)
 	}
 	if c.MaxDownload <= 0 {
 		logger.Warnf("max-downloads should be greater than 0, set it to 200")
@@ -1060,7 +1060,12 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	_, err = f.ReadAt(block.Data, 0)
 	tierID := uint8(0)
 	if err == nil {
-		tierID, err = f.ReadTierID()
+		footer := &stageFooter{}
+		if ferr := footer.unmarshal(f); ferr != nil {
+			logger.Warnf("Parse stage footer of %s failed, upload with default tier: %s", stagingPath, ferr)
+		} else {
+			tierID = footer.Tier
+		}
 	}
 	_ = f.Close()
 	if err != nil {

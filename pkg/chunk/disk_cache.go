@@ -17,13 +17,13 @@
 package chunk
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"hash/fnv"
 	"io"
 	"io/fs"
-	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -44,6 +44,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/murmur3"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 var (
@@ -342,18 +343,25 @@ func (cache *cacheStore) stats() (int64, int64) {
 	return int64(len(cache.pages) + cache.keys.len()), cache.used + cache.usedMemory()
 }
 
+func (cache *cacheStore) isFull(usage DiskFreeRatio, stage bool) bool {
+	if stage {
+		return usage.br < cache.freeRatio/2 || (usage.inodeCap > 0 && usage.fr < cache.freeRatio/2)
+	}
+	return usage.br < cache.freeRatio || (usage.inodeCap > 0 && usage.fr < cache.freeRatio)
+}
+
 func (cache *cacheStore) checkFreeSpace() {
 	for cache.available() {
 		usage := cache.curFreeRatio()
-		cache.stageFull = usage.br < cache.freeRatio/2 || (usage.inodeCap > 0 && usage.fr < cache.freeRatio/2)
-		cache.rawFull = usage.br < cache.freeRatio || (usage.inodeCap > 0 && usage.fr < cache.freeRatio)
+		cache.stageFull = cache.isFull(usage, true)
+		cache.rawFull = cache.isFull(usage, false)
 		if cache.rawFull && cache.keys.name() != EvictionNone {
 			logger.Tracef("Cleanup cache when check free space (%s): free ratio (%d%%), space usage (%d%%), inodes usage (%d%%)", cache.dir, int(cache.freeRatio*100), int(usage.br*100), int(usage.fr*100))
 			cache.Lock()
 			cache.cleanupFull()
 			cache.Unlock()
 			usage = cache.curFreeRatio()
-			cache.rawFull = usage.br < cache.freeRatio || (usage.inodeCap > 0 && usage.fr < cache.freeRatio)
+			cache.rawFull = cache.isFull(usage, false)
 		}
 		if cache.rawFull {
 			cache.uploadStaging()
@@ -411,11 +419,11 @@ func (cache *cacheStore) refreshCacheKeys() {
 	if cache.scanInterval < 0 {
 		return
 	}
-	cache.scanCached()
+	cache.scanCached(true)
 	if cache.scanInterval > 0 {
 		for {
 			time.Sleep(cache.scanInterval)
-			cache.scanCached()
+			cache.scanCached(false)
 		}
 	}
 }
@@ -541,10 +549,18 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tie
 			return
 		}
 	}
-	// write tierID into stage file
 	if tierID != 0 {
-		if err = cache.writeFile(f, []byte{tierID}); err != nil {
-			logger.Warnf("Write tier to cache file %s failed: %s", tmp, err)
+		// only staged file has a footer
+		footer := stageFooter{Tier: tierID}
+		var fData []byte
+		fData, err = (&footer).marshal(cache.checksum != CsNone)
+		if err != nil {
+			logger.Warnf("Marshal stage footer for cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+		if err = cache.writeFile(f, fData); err != nil {
+			logger.Warnf("Write stage footer to cache file %s failed: %s", tmp, err)
 			_ = f.Close()
 			return
 		}
@@ -796,6 +812,20 @@ func (cache *cacheStore) uploaded(key string, size int) {
 	cache.add(key, int32(size), 0)
 }
 
+func (cache *cacheStore) spaceToFree(usage DiskFreeRatio) int64 {
+	if usage.br < cache.freeRatio {
+		return int64(float64(usage.spaceCap) * float64(cache.freeRatio-usage.br))
+	}
+	return 0
+}
+
+func (cache *cacheStore) inodesToFree(usage DiskFreeRatio) int64 {
+	if usage.fr < cache.freeRatio {
+		return int64(float64(usage.inodeCap) * float64(cache.freeRatio-usage.fr))
+	}
+	return 0
+}
+
 // locked
 func (cache *cacheStore) cleanupFull() {
 	if !cache.available() {
@@ -811,20 +841,18 @@ func (cache *cacheStore) cleanupFull() {
 	// make sure we have enough free space after cleanup
 	usage := cache.curFreeRatio()
 	cache.Lock()
-	if usage.br < cache.freeRatio {
-		toFree := int64(float32(usage.spaceCap) * (cache.freeRatio - usage.br))
+	if toFree := cache.spaceToFree(usage); toFree > 0 {
 		if toFree > cache.used {
 			goal = 0
 		} else if cache.used-toFree < goal {
 			goal = (cache.used - toFree) * 95 / 100
 		}
 	}
-	if usage.fr < cache.freeRatio {
-		toFree := int(float32(usage.inodeCap) * (cache.freeRatio - usage.fr))
-		if toFree > cache.keys.len() {
+	if toFree := cache.inodesToFree(usage); toFree > 0 {
+		if toFree > int64(cache.keys.len()) {
 			num = 0
 		} else {
-			num = int64(cache.keys.len()-toFree) * 99 / 100
+			num = (int64(cache.keys.len()) - toFree) * 99 / 100
 		}
 	}
 	if int64(cache.keys.len()) <= num && cache.used <= goal {
@@ -864,10 +892,11 @@ func (cache *cacheStore) uploadStaging() {
 	if !cache.scanned || cache.uploader == nil {
 		return
 	}
-	var toFree int64
 	usage := cache.curFreeRatio()
-	if usage.br < cache.freeRatio || usage.fr < cache.freeRatio {
-		toFree = int64(float64(usage.spaceCap)*float64(cache.freeRatio) - math.Min(float64(usage.br), float64(usage.fr)))
+	spaceToFree := cache.spaceToFree(usage)
+	inodeToFree := cache.inodesToFree(usage)
+	if spaceToFree <= 0 && inodeToFree <= 0 {
+		return
 	}
 	cache.Lock()
 	defer cache.Unlock()
@@ -898,11 +927,12 @@ func (cache *cacheStore) uploadStaging() {
 			logger.Debugf("upload %s, age: %d", key, uint32(time.Now().Unix())-lastValue.atime)
 			cache.Lock()
 			// the size in keys should be updated
-			toFree -= int64(-lastValue.size + 4096)
+			spaceToFree -= int64(-lastValue.size + 4096)
+			inodeToFree--
 			cnt = 0
 		}
 
-		if toFree < 0 {
+		if spaceToFree <= 0 && inodeToFree <= 0 {
 			break
 		}
 	}
@@ -916,7 +946,7 @@ func (cache *cacheStore) uploadStaging() {
 	}
 }
 
-func (cache *cacheStore) scanCached() {
+func (cache *cacheStore) scanCached(fast bool) {
 	cache.Lock()
 	cache.used = 0
 	// atime in memory is more accurate than on disk, inherit it for the next round
@@ -929,7 +959,16 @@ func (cache *cacheStore) scanCached() {
 
 	cachePrefix := filepath.Join(cache.dir, cacheDir)
 	logger.Debugf("Scan %s to find cached blocks", cachePrefix)
-	_ = fastwalk.Walk(nil, cachePrefix, func(path string, d fs.DirEntry, err error) error {
+
+	walkDir := func(path string, walkFn fs.WalkDirFunc) error {
+		if fast {
+			return fastwalk.Walk(nil, path, walkFn)
+		} else {
+			return filepath.WalkDir(path, walkFn)
+		}
+	}
+
+	_ = walkDir(cachePrefix, func(path string, d fs.DirEntry, err error) error {
 		// this func should be concurrent safe
 		if err != nil {
 			return nil
@@ -1316,14 +1355,103 @@ const (
 
 var crc32c = crc32.MakeTable(crc32.Castagnoli)
 
-const tierIDLength = int64(1) // 1 byte for tierID in the end of cache file
+const maxTierID = 3 // maximum valid tier id
+
+// stageFooter is msgpack metadata appended at the end of a stage file:
+//
+//   - file content: [data] [checksum?] [footer]
+//   - footer: [magic uint16] [len uint16] [msgpack data]
+//
+// We use trailer length parity to indicate
+// checksum presence (checksum bytes are always multiple of 4):
+//   - with checksum: msgpack length is padded to a multiple of 4
+//   - without checksum: msgpack length is padded to a non-multiple of 4
+//
+// Therefore, trailer length (checksum + msgpack) is multiple of 4 iff checksum
+// exists, so openCacheFile can distinguish the two and find the trailing
+// msgpack metadata.
+type stageFooter struct {
+	Tier uint8  `msgpack:"tier"`
+	Pad  []byte `msgpack:"pad"` // pad to make msgpack length parity match checksum presence
+}
+
+func (f *stageFooter) marshal(align bool) ([]byte, error) {
+	var p int
+	switch r := stageFooterBaseLen % 4; {
+	case align:
+		p = (4 - r) % 4 // pad up to the next multiple of 4
+	case r == 0:
+		p = 1 // break the multiple-of-4 alignment
+	}
+	f.Pad = stageFooterPad[p]
+	data, err := msgpack.Marshal(f)
+	if err != nil {
+		return nil, err
+	}
+
+	buff := make([]byte, 0, 4+len(data))
+	buff = binary.BigEndian.AppendUint16(buff, stageFooterMagic)
+	buff = binary.BigEndian.AppendUint16(buff, uint16(len(data)))
+	buff = append(buff, data...)
+	return buff, nil
+}
+
+func (f *stageFooter) unmarshal(cf *cacheFile) error {
+	if cf.footerOff == 0 {
+		f.Tier = 0 // no footer, fall back to the default
+		return nil
+	}
+	var hdr [4]byte
+	if _, err := cf.File.ReadAt(hdr[:], cf.footerOff); err != nil {
+		return fmt.Errorf("read stage footer header: %w", err)
+	}
+	if magic := binary.BigEndian.Uint16(hdr[:2]); magic != stageFooterMagic {
+		return fmt.Errorf("invalid stage footer magic %#04x", magic)
+	}
+	size := int64(binary.BigEndian.Uint16(hdr[2:4]))
+	if size == 0 {
+		return fmt.Errorf("invalid stage footer length %d", size)
+	}
+	if cf.footerOff+4+size != cf.size {
+		return fmt.Errorf("stage footer size mismatch: offset %d, size %d, file size %d", cf.footerOff, size, cf.size)
+	}
+	buf := make([]byte, size)
+	if _, err := cf.File.ReadAt(buf, cf.footerOff+4); err != nil {
+		return fmt.Errorf("read stage footer data: %w", err)
+	}
+	if err := msgpack.Unmarshal(buf, f); err != nil {
+		return err
+	}
+	if f.Tier > maxTierID {
+		f.Tier = 0 // ignore unknown/corrupted tier, fall back to the default
+	}
+	return nil
+}
+
+var (
+	stageFooterBaseLen int
+	stageFooterPad     [4][]byte
+	stageFooterMagic   = uint16(0x4653)
+)
+
+func init() {
+	b, err := msgpack.Marshal(&stageFooter{Pad: make([]byte, 0)})
+	if err != nil {
+		panic(err)
+	}
+	stageFooterBaseLen = len(b)
+
+	for i := 0; i < len(stageFooterPad); i++ {
+		stageFooterPad[i] = make([]byte, i)
+	}
+}
 
 type cacheFile struct {
 	*os.File
-	length   int // length of data
-	csLevel  string
-	hasTier  bool
-	fileSize int64
+	length    int // length of data
+	csLevel   string
+	size      int64 // size of file
+	footerOff int64 // offset of stageFooter in file (0 if none)
 }
 
 // Calculate 32-bits checksum for every 32 KiB data, so 512 Bytes for 4 MiB in total
@@ -1351,22 +1479,31 @@ func openCacheFile(name string, length int, level string) (*cacheFile, error) {
 		_ = fp.Close()
 		return nil, err
 	}
-	checksumLength := ((length-1)/csBlock + 1) * 4
-	hasTier := false
-	switch fi.Size() - int64(length) {
-	case 0:
-		level = CsNone
-	case tierIDLength:
-		level = CsNone
-		hasTier = true
-	case int64(checksumLength):
-	case int64(checksumLength) + tierIDLength:
-		hasTier = true
-	default:
+	checksumLength := int64(((length-1)/csBlock + 1) * 4)
+	extra := fi.Size() - int64(length)
+	if extra < 0 {
 		_ = fp.Close()
 		return nil, fmt.Errorf("invalid file size %d, data length %d", fi.Size(), length)
 	}
-	return &cacheFile{File: fp, length: length, csLevel: level, hasTier: hasTier, fileSize: fi.Size()}, nil
+	footerOff := int64(0)
+	switch {
+	case extra == 0:
+		level = CsNone // data only, no footer
+	case extra%4 == 0:
+		switch {
+		case extra == checksumLength:
+		case extra > checksumLength:
+			footerOff = int64(length) + checksumLength
+		default:
+			_ = fp.Close()
+			return nil, fmt.Errorf("invalid file size %d, data length %d, checksum length %d", fi.Size(), length, checksumLength)
+		}
+	default:
+		level = CsNone
+		footerOff = int64(length)
+	}
+	cf := &cacheFile{File: fp, length: length, csLevel: level, footerOff: footerOff, size: fi.Size()}
+	return cf, nil
 }
 
 func (cf *cacheFile) ReadAt(b []byte, off int64) (n int, err error) {
@@ -1443,22 +1580,4 @@ func (cf *cacheFile) ReadAt(b []byte, off int64) (n int, err error) {
 		}
 	}
 	return
-}
-
-func (cf *cacheFile) ReadTierID() (uint8, error) {
-	if !cf.hasTier {
-		return 0, nil
-	}
-	var buf [1]byte
-	n, err := cf.File.ReadAt(buf[:], cf.fileSize-tierIDLength)
-	if err != nil {
-		return 0, err
-	} else if n != 1 {
-		return 0, fmt.Errorf("invalid tierID length %d, expect %d", n, tierIDLength)
-	}
-	if buf[0] > 3 {
-		logger.Errorf("Invalid tierID %d in cache file %s", buf[0], cf.Name())
-		return 0, nil
-	}
-	return buf[0], nil
 }

@@ -55,6 +55,53 @@ func testFormat() *Format {
 	return &Format{Name: "test", DirStats: true}
 }
 
+func checkResult(expect dirStat, stat *dirStat, st syscall.Errno) error {
+	if st != 0 {
+		return fmt.Errorf("get dir usage: %s", st)
+	}
+	if stat == nil {
+		return fmt.Errorf("get dir usage: nil stat")
+	}
+	if expect.length >= 0 && stat.length != expect.length {
+		return fmt.Errorf("expect %+v, but got %+v", expect, stat)
+	}
+	if expect.space >= 0 && stat.space != expect.space {
+		return fmt.Errorf("expect %+v, but got %+v", expect, stat)
+	}
+	if expect.inodes >= 0 && stat.inodes != expect.inodes {
+		return fmt.Errorf("expect %+v, but got %+v", expect, stat)
+	}
+	return nil
+}
+
+func waitCheckResult(m Meta, expect dirStat, statFn func() (*dirStat, syscall.Errno)) error {
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for {
+		m.FlushSession()
+		stat, st := statFn()
+		if err := checkResult(expect, stat, st); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func assertInodes(t *testing.T, m Meta, label string, dirIno Ino, expected int64) {
+	t.Helper()
+	ctx := Background()
+	if err := waitCheckResult(m, dirStat{length: -1, space: -1, inodes: expected}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(ctx, dirIno)
+	}); err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
+}
+
 func TestRedisClient(t *testing.T) {
 	m, err := newRedisMeta("redis", "127.0.0.1:6379/10", testConfig())
 	if err != nil || m.Name() != "redis" {
@@ -155,6 +202,8 @@ func testMeta(t *testing.T, m Meta) {
 	testCaseIncensiHardlinkRename(t, m)
 	testCheckAndRepair(t, m)
 	testDirStat(t, m)
+	testRenameDirStat(t, m)
+	testRenameDirStatWithTrash(t, m)
 	testClone(t, m)
 	testBatchClone(t, m)
 	testACL(t, m)
@@ -637,6 +686,56 @@ func testMetaClient(t *testing.T, m Meta) {
 			t.Fatalf("sgid should be cleared")
 		}
 
+		var p2 Ino
+		ctx4 := NewContext(3, 3, []uint32{3, 1})
+		if st := m.Mkdir(ctx4, 1, "d3", 0775, 0, 0, &p2, attr); st != 0 {
+			t.Fatalf("mkdir d3: %s", st)
+		}
+		if st := m.SetAttr(ctx4, p2, SetAttrGID, 0, &Attr{Gid: 1}); st != 0 {
+			t.Fatalf("chgrp d3: %s", st)
+		}
+		if st := m.SetAttr(ctx4, p2, SetAttrMode, 0, &Attr{Mode: 02775}); st != 0 {
+			t.Fatalf("chmod g+s d3: %s", st)
+		}
+		if st := m.GetAttr(ctx4, p2, attr); st != 0 {
+			t.Fatalf("getattr d3: %s", st)
+		} else if attr.Mode&02000 == 0 {
+			t.Fatalf("sgid should be kept when gid is in supplementary groups")
+		}
+		if st := m.Rmdir(ctx4, 1, "d3"); st != 0 {
+			t.Fatalf("rmdir d3: %s", st)
+		}
+
+		fdCtx := newFuseDefaultCtx(10, 10) // uid=10, primary gid=10 only
+		var pf, ff Ino
+		if st := m.Mkdir(ctx, 1, "d_fuse", 0755, 0, 0, &pf, attr); st != 0 {
+			t.Fatalf("mkdir d_fuse: %s", st)
+		}
+		if st := m.SetAttr(ctx, pf, SetAttrUID|SetAttrGID, 0, &Attr{Uid: 10, Gid: 20}); st != 0 {
+			t.Fatalf("chown d_fuse: %s", st)
+		}
+		// chmod path (mergeAttr): chmod g+s on a dir whose group (20) is not caller's group
+		if st := m.SetAttr(fdCtx, pf, SetAttrMode, 0, &Attr{Mode: 02755}); st != 0 {
+			t.Fatalf("chmod g+s d_fuse: %s", st)
+		}
+		if st := m.GetAttr(fdCtx, pf, attr); st != 0 {
+			t.Fatalf("getattr d_fuse: %s", st)
+		} else if attr.Mode&02000 == 0 {
+			t.Fatalf("sgid should be kept in FUSE default mode (chmod)")
+		}
+		// create path (inheritMode): create a group-executable setgid file under the
+		// setgid parent dir whose group (20) is not in caller's Gids().
+		if st := m.Mknod(fdCtx, pf, "f_fuse", TypeFile, 02755, 0, 0, "", &ff, attr); st != 0 {
+			t.Fatalf("create f_fuse: %s", st)
+		} else if attr.Mode&02000 == 0 {
+			t.Fatalf("sgid should be kept in FUSE default mode (create)")
+		}
+		if st := m.Unlink(fdCtx, pf, "f_fuse"); st != 0 {
+			t.Fatalf("unlink f_fuse: %s", st)
+		}
+		if st := m.Rmdir(ctx, 1, "d_fuse"); st != 0 {
+			t.Fatalf("rmdir d_fuse: %s", st)
+		}
 	}
 	if st := m.Resolve(ctx2, 1, "/d1/d2", nil, nil, false); st != 0 && st != syscall.ENOTSUP {
 		t.Fatalf("resolve /d1/d2: %s", st)
@@ -1058,9 +1157,18 @@ func testMetaClient(t *testing.T, m Meta) {
 	if st := m.Unlink(ctx, 1, "f3"); st != 0 {
 		t.Fatalf("unlink f3: %s", st)
 	}
-	time.Sleep(time.Millisecond * 100) // wait for delete
-	if st := m.Read(ctx, inode, 0, &slices); st != syscall.ENOENT {
-		t.Fatalf("read chunk: %s", st)
+	var i int
+	for i = 0; i < 200; i++ {
+		if st := m.Read(ctx, inode, 0, &slices); st == syscall.ENOENT {
+			break
+		}
+		time.Sleep(time.Millisecond * 100)
+	}
+	if i >= 200 {
+		var attr Attr
+		stLookup := m.Lookup(ctx, 1, "f", &inode, &attr, false)
+		stGetAttr := m.GetAttr(ctx, inode, &attr)
+		t.Fatalf("chunk not delete after 20s, Lookup: %s, GetAttr: %s", stLookup, stGetAttr)
 	}
 	if st := m.Rmdir(ctx, 1, "d"); st != 0 {
 		t.Fatalf("rmdir d: %s", st)
@@ -2126,6 +2234,21 @@ func testTrash(t *testing.T, m Meta) {
 	ctx := Background()
 	var inode, parent Ino
 	var attr = &Attr{}
+	getDirStat := func(ino Ino) *dirStat {
+		stat, st := m.GetDirStat(ctx, ino)
+		if st != 0 {
+			t.Fatalf("get dir stat %d: %s", ino, st)
+		}
+		return stat
+	}
+	waitDirStatInodes := func(ino Ino, expected int64, scene string) {
+		if err := waitCheckResult(m, dirStat{length: -1, space: -1, inodes: expected}, func() (*dirStat, syscall.Errno) {
+			return m.GetDirStat(ctx, ino)
+		}); err != nil {
+			t.Fatalf("%s: %v", scene, err)
+		}
+	}
+	var trashDir Ino
 	if st := m.Create(ctx, 1, "f1", 0644, 022, 0, &inode, attr); st != 0 {
 		t.Fatalf("create f1: %s", st)
 	}
@@ -2141,12 +2264,18 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Rename(ctx, 1, "f1", 1, "d", 0, &inode, attr); st != syscall.EISDIR {
 		t.Fatalf("rename f1 -> d: %s", st)
 	}
+	trashBeforeUnlink := int64(0)
+	if st := m.GetAttr(ctx, TrashInode+1, attr); st == 0 {
+		trashBeforeUnlink = getDirStat(TrashInode + 1).inodes
+	}
 	if st := m.Unlink(ctx, parent, "f"); st != 0 {
 		t.Fatalf("unlink d/f: %s", st)
 	}
 	if st := m.GetAttr(ctx, inode, attr); st != 0 || attr.Parent != TrashInode+1 {
 		t.Fatalf("getattr f(%d): %s, attr %+v", inode, st, attr)
 	}
+	trashDir = attr.Parent
+	waitDirStatInodes(trashDir, trashBeforeUnlink+1, "trash dir inodes after unlink d/f")
 	if st := m.Truncate(ctx, inode, 0, 1<<30, attr, false); st != syscall.EPERM {
 		t.Fatalf("should not truncate a file in trash")
 	}
@@ -2160,12 +2289,14 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Mkdir(ctx, 1, "d2", 0755, 022, 0, &parent2, attr); st != 0 {
 		t.Fatalf("mkdir d2: %s", st)
 	}
+	trashBeforeRmdir := getDirStat(trashDir)
 	if st := m.Rmdir(ctx, 1, "d2"); st != 0 {
 		t.Fatalf("rmdir d2: %s", st)
 	}
 	if st := m.GetAttr(ctx, parent2, attr); st != 0 || attr.Parent != TrashInode+1 {
 		t.Fatalf("getattr d2(%d): %s, attr %+v", parent2, st, attr)
 	}
+	waitDirStatInodes(trashDir, trashBeforeRmdir.inodes+1, "trash dir inodes after rmdir d2")
 	var tino Ino
 	if st := m.Mkdir(ctx, parent2, "d3", 0777, 022, 0, &tino, attr); st != syscall.ENOENT {
 		t.Fatalf("mkdir inside trash should fail")
@@ -2179,9 +2310,11 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Rename(ctx, 1, "d", parent2, "ttlink", 0, &tino, attr); st != syscall.ENOENT {
 		t.Fatalf("link inside trash should fail")
 	}
+	trashBeforeRmdirD := getDirStat(trashDir)
 	if st := m.Rmdir(ctx, 1, "d"); st != 0 {
 		t.Fatalf("rmdir d: %s", st)
 	}
+	waitDirStatInodes(trashDir, trashBeforeRmdirD.inodes+1, "trash dir inodes after rmdir d")
 	if st := m.Rename(ctx, 1, "f1", 1, "d", 0, &inode, attr); st != 0 {
 		t.Fatalf("rename f1 -> d: %s", st)
 	}
@@ -2191,9 +2324,11 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Rename(ctx, 1, "f2", TrashInode+1, "td", 0, &inode, attr); st != syscall.EPERM {
 		t.Fatalf("rename f2 -> td: %s", st)
 	}
+	trashBeforeRename := getDirStat(trashDir)
 	if st := m.Rename(ctx, 1, "f2", 1, "d", 0, &inode, attr); st != 0 {
 		t.Fatalf("rename f2 -> d: %s", st)
 	}
+	waitDirStatInodes(trashDir, trashBeforeRename.inodes+1, "trash dir inodes after rename overwrite")
 	if st := m.Link(ctx, inode, 1, "l", attr); st != 0 || attr.Nlink != 2 {
 		t.Fatalf("link d -> l1: %s", st)
 	}
@@ -2242,6 +2377,49 @@ func testTrash(t *testing.T, m Meta) {
 	if len(entries) != 9 {
 		t.Fatalf("entries: %d", len(entries))
 	}
+
+	// test BatchUnlink: entries should be moved into trash and update dir stats
+	var bu1, bu2 Ino
+	if st := m.Create(ctx, 1, "batch_u1", 0644, 022, 0, &bu1, attr); st != 0 {
+		t.Fatalf("create batch_u1: %s", st)
+	}
+	if st := m.Create(ctx, 1, "batch_u2", 0644, 022, 0, &bu2, attr); st != 0 {
+		t.Fatalf("create batch_u2: %s", st)
+	}
+	var buAttr1, buAttr2 Attr
+	if st := m.GetAttr(ctx, bu1, &buAttr1); st != 0 {
+		t.Fatalf("getattr batch_u1: %s", st)
+	}
+	if st := m.GetAttr(ctx, bu2, &buAttr2); st != 0 {
+		t.Fatalf("getattr batch_u2: %s", st)
+	}
+	batchEntries := []*Entry{
+		{Inode: bu1, Name: []byte("batch_u1"), Attr: &buAttr1},
+		{Inode: bu2, Name: []byte("batch_u2"), Attr: &buAttr2},
+	}
+	trashBeforeBatch := getDirStat(trashDir)
+	var batchCount uint64
+	if st := m.getBase().BatchUnlink(ctx, RootInode, batchEntries, &batchCount, false); st != 0 {
+		t.Fatalf("batch unlink under root: %s", st)
+	}
+	if batchCount != 2 {
+		t.Fatalf("batch unlink count: expect 2, got %d", batchCount)
+	}
+	m.FlushSession()
+	trashAfterBatch := getDirStat(trashDir)
+	if trashAfterBatch.inodes < trashBeforeBatch.inodes+2 {
+		t.Fatalf("trash dir inodes after BatchUnlink: expect at least %d, got %d", trashBeforeBatch.inodes+2, trashAfterBatch.inodes)
+	}
+	batchTrashName1 := fmt.Sprintf("1-%d-%s", bu1, "batch_u1")
+	batchTrashName2 := fmt.Sprintf("1-%d-%s", bu2, "batch_u2")
+	var trashIno Ino
+	if st := m.Lookup(ctx, trashDir, batchTrashName1, &trashIno, attr, true); st != 0 {
+		t.Fatalf("lookup trash/%s: %s", batchTrashName1, st)
+	}
+	if st := m.Lookup(ctx, trashDir, batchTrashName2, &trashIno, attr, true); st != 0 {
+		t.Fatalf("lookup trash/%s: %s", batchTrashName2, st)
+	}
+
 	// test Remove with skipTrash true/false
 	if st := m.Mkdir(ctx, 1, "d10", 0755, 022, 0, &parent, attr); st != 0 {
 		t.Fatalf("mkdir d10: %s", st)
@@ -2259,7 +2437,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	if st := m.Mkdir(ctx, 1, "d10", 0755, 022, 0, &parent, attr); st != 0 {
@@ -2278,7 +2456,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 
@@ -2301,7 +2479,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	entries = entries[:0]
@@ -2314,7 +2492,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	entries = entries[:0]
@@ -2330,7 +2508,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Readdir(ctx, TrashInode+1, 0, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	}
-	if len(entries) != 12 {
+	if len(entries) != 14 {
 		t.Fatalf("entries: %d", len(entries))
 	}
 	entries = entries[:0]
@@ -2529,9 +2707,6 @@ func testConcurrentDir(t *testing.T, m Meta) {
 		}(i)
 	}
 	g.Wait()
-	if err != nil {
-		t.Fatalf("concurrent dir: %s", err)
-	}
 	for i := 0; i < 100; i++ {
 		g.Add(1)
 		go func(i int) {
@@ -2758,6 +2933,16 @@ func setAttr(t *testing.T, m Meta, inode Ino, attr *Attr) {
 func testCheckAndRepair(t *testing.T, m Meta) {
 	var checkInode, d1Inode, d2Inode, d3Inode, d4Inode Ino
 	dirAttr := &Attr{Mode: 0644, Full: true, Typ: TypeDirectory, Nlink: 3}
+	if st := m.Lookup(Background(), RootInode, "check", &checkInode, dirAttr, false); st == 0 {
+		var count uint64
+		if st := m.Remove(Background(), RootInode, "check", true, 1, &count); st != 0 {
+			t.Fatalf("pre-cleanup check dir: %s", st)
+		}
+	}
+	defer func() {
+		var count uint64
+		m.Remove(Background(), RootInode, "check", true, 1, &count)
+	}()
 	if st := m.Mkdir(Background(), RootInode, "check", 0640, 022, 0, &checkInode, dirAttr); st != 0 {
 		t.Fatalf("mkdir: %s", st)
 	}
@@ -2891,77 +3076,88 @@ func testDirStat(t *testing.T, m Meta) {
 		t.Fatalf("new session: %s", err)
 	}
 	defer m.CloseSession()
-	stat, st := m.GetDirStat(Background(), testInode)
-	checkResult := func(length, space, inodes int64) {
-		if st != 0 {
-			t.Fatalf("get dir usage: %s", st)
-		}
-		expect := dirStat{length, space, inodes}
-		if *stat != expect {
-			t.Fatalf("test dir usage: expect %+v, but got %+v", expect, stat)
-		}
+	if err := waitCheckResult(m, dirStat{0, 0, 0}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage empty: %v", err)
 	}
-	checkResult(0, 0, 0)
 
 	// test dir with file
 	var fileInode Ino
 	if st := m.Create(Background(), testInode, "file", 0640, 022, 0, &fileInode, nil); st != 0 {
 		t.Fatalf("create: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(0, align4K(0), 1)
+	if err := waitCheckResult(m, dirStat{0, align4K(0), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage create: %v", err)
+	}
 
 	// test dir with file and fallocate
 	if st := m.Fallocate(Background(), fileInode, 0, 0, 4097, nil); st != 0 {
 		t.Fatalf("fallocate: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(4097, align4K(4097), 1)
+	if err := waitCheckResult(m, dirStat{4097, align4K(4097), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage fallocate: %v", err)
+	}
 
 	// test dir with file and truncate
 	if st := m.Truncate(Background(), fileInode, 0, 0, nil, false); st != 0 {
 		t.Fatalf("truncate: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(0, align4K(0), 1)
+	if err := waitCheckResult(m, dirStat{0, align4K(0), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage truncate: %v", err)
+	}
 
 	// test dir with file and write
 	if st := m.Write(Background(), fileInode, 0, 0, Slice{Id: 1, Size: 1 << 20, Off: 0, Len: 4097}, time.Now()); st != 0 {
 		t.Fatalf("write: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(4097, align4K(4097), 1)
+	if err := waitCheckResult(m, dirStat{4097, align4K(4097), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage write: %v", err)
+	}
 
 	// test dir with file and link
 	if st := m.Link(Background(), fileInode, testInode, "file2", nil); st != 0 {
 		t.Fatalf("link: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(2*4097, 2*align4K(4097), 2)
+	if err := waitCheckResult(m, dirStat{2 * 4097, 2 * align4K(4097), 2}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage link: %v", err)
+	}
 
 	// test dir with subdir
 	var subInode Ino
 	if st := m.Mkdir(Background(), testInode, "sub", 0640, 022, 0, &subInode, nil); st != 0 {
 		t.Fatalf("mkdir: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(2*4097, align4K(0)+2*align4K(4097), 3)
+	if err := waitCheckResult(m, dirStat{2 * 4097, align4K(0) + 2*align4K(4097), 3}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage mkdir sub: %v", err)
+	}
 
 	// test rename
 	if st := m.Rename(Background(), testInode, "file2", subInode, "file", 0, nil, nil); st != 0 {
 		t.Fatalf("rename: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(4097, align4K(0)+align4K(4097), 2)
-	stat, st = m.GetDirStat(Background(), subInode)
-	checkResult(4097, align4K(4097), 1)
+	if err := waitCheckResult(m, dirStat{4097, align4K(0) + align4K(4097), 2}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage rename src: %v", err)
+	}
+	if err := waitCheckResult(m, dirStat{4097, align4K(4097), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), subInode)
+	}); err != nil {
+		t.Fatalf("test dir usage rename dst: %v", err)
+	}
 
 	// test unlink
 	if st := m.Unlink(Background(), testInode, "file"); st != 0 {
@@ -2970,19 +3166,370 @@ func testDirStat(t *testing.T, m Meta) {
 	if st := m.Unlink(Background(), subInode, "file"); st != 0 {
 		t.Fatalf("unlink: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(0, align4K(0), 1)
-	stat, st = m.GetDirStat(Background(), subInode)
-	checkResult(0, 0, 0)
+	if err := waitCheckResult(m, dirStat{0, align4K(0), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage unlink src: %v", err)
+	}
+	if err := waitCheckResult(m, dirStat{0, 0, 0}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), subInode)
+	}); err != nil {
+		t.Fatalf("test dir usage unlink dst: %v", err)
+	}
 
 	// test rmdir
 	if st := m.Rmdir(Background(), testInode, "sub"); st != 0 {
 		t.Fatalf("rmdir: %s", st)
 	}
-	time.Sleep(500 * time.Millisecond)
-	stat, st = m.GetDirStat(Background(), testInode)
-	checkResult(0, 0, 0)
+	if err := waitCheckResult(m, dirStat{0, 0, 0}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage rmdir: %v", err)
+	}
+}
+
+func testRenameDirStat(t *testing.T, m Meta) {
+	ctx := Background()
+	var attr Attr
+	var dir1, dir2, dir3 Ino
+	var file1Inode, file2Inode Ino
+
+	// setup: create 3 directories
+	if st := m.Mkdir(ctx, RootInode, "dir1", 0755, 022, 0, &dir1, &attr); st != 0 {
+		t.Fatalf("mkdir dir1: %s", st)
+	}
+	if st := m.Mkdir(ctx, RootInode, "dir2", 0755, 022, 0, &dir2, &attr); st != 0 {
+		t.Fatalf("mkdir dir2: %s", st)
+	}
+	if st := m.Mkdir(ctx, RootInode, "dir3", 0755, 022, 0, &dir3, &attr); st != 0 {
+		t.Fatalf("mkdir dir3: %s", st)
+	}
+	defer func() {
+		m.Rmdir(ctx, RootInode, "dir1")
+		m.Rmdir(ctx, RootInode, "dir2")
+		m.Rmdir(ctx, RootInode, "dir3")
+	}()
+
+	if err := m.NewSession(true); err != nil {
+		t.Fatalf("new session: %s", err)
+	}
+	defer m.CloseSession()
+
+	// Test 1: Rename file from dir1 to dir2 (cross-directory, no overwrite)
+	assertInodes(t, m, "Test 1 pre-condition dir1", dir1, 0)
+	assertInodes(t, m, "Test 1 pre-condition dir2", dir2, 0)
+	{
+		if st := m.Create(ctx, dir1, "file1", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create file1: %s", st)
+		}
+		assertInodes(t, m, "Test 1 after create dir1", dir1, 1)
+		if st := m.Rename(ctx, dir1, "file1", dir2, "file1", 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename file1 to dir2: %s", st)
+		}
+		assertInodes(t, m, "Test 1 dir1 after rename", dir1, 0)
+		assertInodes(t, m, "Test 1 dir2 after rename", dir2, 1)
+		if st := m.Unlink(ctx, dir2, "file1"); st != 0 {
+			t.Fatalf("cleanup dir2/file1: %s", st)
+		}
+		assertInodes(t, m, "Test 1 cleanup dir2", dir2, 0)
+		t.Logf("Test 1 passed: cross-dir rename without overwrite")
+	}
+
+	// Test 2: Rename file within same directory (no overwrite)
+	assertInodes(t, m, "Test 2 pre-condition dir1", dir1, 0)
+	{
+		if st := m.Create(ctx, dir1, "file2", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create file2: %s", st)
+		}
+		assertInodes(t, m, "Test 2 after create dir1", dir1, 1)
+		if st := m.Rename(ctx, dir1, "file2", dir1, "file3", 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("rename file2 to file3 in same dir: %s", st)
+		}
+		assertInodes(t, m, "Test 2 same dir after rename", dir1, 1)
+		if st := m.Unlink(ctx, dir1, "file3"); st != 0 {
+			t.Fatalf("cleanup dir1/file3: %s", st)
+		}
+		assertInodes(t, m, "Test 2 cleanup dir1", dir1, 0)
+		t.Logf("Test 2 passed: same-dir rename without overwrite")
+	}
+
+	// Test 3: Rename with overwrite in same directory (trash disabled)
+	assertInodes(t, m, "Test 3 pre-condition dir1", dir1, 0)
+	{
+		if st := m.Create(ctx, dir1, "file4", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create file4: %s", st)
+		}
+		if st := m.Create(ctx, dir1, "file5", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create file5: %s", st)
+		}
+		assertInodes(t, m, "Test 3 after creates dir1", dir1, 2)
+		if st := m.Rename(ctx, dir1, "file4", dir1, "file5", 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename file4 to file5 (overwrite): %s", st)
+		}
+		assertInodes(t, m, "Test 3 overwrite inodes", dir1, 1)
+		if st := m.Unlink(ctx, dir1, "file5"); st != 0 {
+			t.Fatalf("cleanup file5 after Test 3: %s", st)
+		}
+		assertInodes(t, m, "Test 3 cleanup dir1", dir1, 0)
+		t.Logf("Test 3 passed: same-dir rename with overwrite")
+	}
+
+	// Test 4: Rename with overwrite across directories
+	assertInodes(t, m, "Test 4 pre-condition dir2", dir2, 0)
+	assertInodes(t, m, "Test 4 pre-condition dir3", dir3, 0)
+	{
+		if st := m.Create(ctx, dir2, "file1", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create file1 in dir2: %s", st)
+		}
+		if st := m.Create(ctx, dir3, "file_src", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create file_src in dir3: %s", st)
+		}
+		assertInodes(t, m, "Test 4 after create dir2", dir2, 1)
+		assertInodes(t, m, "Test 4 after create dir3", dir3, 1)
+		if st := m.Rename(ctx, dir3, "file_src", dir2, "file1", 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("rename file_src to file1 (overwrite cross-dir): %s", st)
+		}
+		assertInodes(t, m, "Test 4 dir2 after rename", dir2, 1)
+		assertInodes(t, m, "Test 4 dir3 after rename", dir3, 0)
+		if st := m.Unlink(ctx, dir2, "file1"); st != 0 {
+			t.Fatalf("cleanup dir2/file1: %s", st)
+		}
+		assertInodes(t, m, "Test 4 cleanup dir2", dir2, 0)
+		t.Logf("Test 4 passed: cross-dir rename with overwrite")
+	}
+
+	// Test 5: Exchange rename across directories
+	assertInodes(t, m, "Test 5 pre-condition dir1", dir1, 0)
+	assertInodes(t, m, "Test 5 pre-condition dir3", dir3, 0)
+	{
+		if st := m.Create(ctx, dir1, "ex1", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create ex1: %s", st)
+		}
+		if st := m.Create(ctx, dir3, "ex2", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create ex2: %s", st)
+		}
+		assertInodes(t, m, "Test 5 after create dir1", dir1, 1)
+		assertInodes(t, m, "Test 5 after create dir3", dir3, 1)
+		if st := m.Rename(ctx, dir1, "ex1", dir3, "ex2", RenameExchange, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename exchange ex1 <-> ex2: %s", st)
+		}
+		assertInodes(t, m, "Test 5 dir1 after exchange", dir1, 1)
+		assertInodes(t, m, "Test 5 dir3 after exchange", dir3, 1)
+		if st := m.Unlink(ctx, dir1, "ex1"); st != 0 {
+			t.Fatalf("cleanup ex1 after Test 5: %s", st)
+		}
+		if st := m.Unlink(ctx, dir3, "ex2"); st != 0 {
+			t.Fatalf("cleanup ex2 after Test 5: %s", st)
+		}
+		assertInodes(t, m, "Test 5 cleanup dir1", dir1, 0)
+		assertInodes(t, m, "Test 5 cleanup dir3", dir3, 0)
+		t.Logf("Test 5 passed: exchange rename")
+	}
+
+	// Test 6: Same-directory exchange
+	assertInodes(t, m, "Test 6 pre-condition dir1", dir1, 0)
+	{
+		if st := m.Create(ctx, dir1, "file_a", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create file_a: %s", st)
+		}
+		if st := m.Create(ctx, dir1, "file_b", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create file_b: %s", st)
+		}
+		assertInodes(t, m, "Test 6 after creates dir1", dir1, 2)
+		if st := m.Rename(ctx, dir1, "file_a", dir1, "file_b", RenameExchange, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename same-dir exchange file_a <-> file_b: %s", st)
+		}
+		assertInodes(t, m, "Test 6 same dir after exchange", dir1, 2)
+		if st := m.Unlink(ctx, dir1, "file_b"); st != 0 {
+			t.Fatalf("cleanup dir1/file_b: %s", st)
+		}
+		if st := m.Unlink(ctx, dir1, "file_a"); st != 0 {
+			t.Fatalf("cleanup dir1/file_a: %s", st)
+		}
+		assertInodes(t, m, "Test 6 cleanup dir1", dir1, 0)
+		t.Logf("Test 6 passed: same-dir exchange rename")
+	}
+}
+
+func testRenameDirStatWithTrash(t *testing.T, m Meta) {
+	format := testFormat()
+	format.TrashDays = 1
+	if err := m.Init(format, false); err != nil {
+		t.Fatalf("init with trash: %v", err)
+	}
+	defer func() {
+		if err := m.Init(testFormat(), false); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+	}()
+
+	ctx := Background()
+	var dir1, dir2 Ino
+	var file1Inode, file2Inode Ino
+	var attr = Attr{}
+
+	if st := m.Mkdir(ctx, RootInode, "trash_dir1", 0755, 022, 0, &dir1, &attr); st != 0 {
+		t.Fatalf("mkdir trash_dir1: %s", st)
+	}
+	if st := m.Mkdir(ctx, RootInode, "trash_dir2", 0755, 022, 0, &dir2, &attr); st != 0 {
+		t.Fatalf("mkdir trash_dir2: %s", st)
+	}
+	defer func() {
+		m.Rmdir(ctx, RootInode, "trash_dir1")
+		m.Rmdir(ctx, RootInode, "trash_dir2")
+	}()
+
+	if err := m.NewSession(true); err != nil {
+		t.Fatalf("new session: %s", err)
+	}
+	defer m.CloseSession()
+
+	// Test with trash enabled: overwrite should move to trash instead of delete
+	{
+		assertInodes(t, m, "Test trash overwrite pre-condition dir1", dir1, 0)
+		if st := m.Create(ctx, dir1, "trash_file1", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create trash_file1: %s", st)
+		}
+		if st := m.Create(ctx, dir1, "trash_file2", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create trash_file2: %s", st)
+		}
+		assertInodes(t, m, "Test trash overwrite after creates dir1", dir1, 2)
+		if st := m.Rename(ctx, dir1, "trash_file1", dir1, "trash_file2", 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename with trash enabled: %s", st)
+		}
+		assertInodes(t, m, "Test trash overwrite", dir1, 1)
+		overwritten := Attr{}
+		if st := m.GetAttr(ctx, file2Inode, &overwritten); st != 0 && st != syscall.ENOENT {
+			t.Fatalf("Test trash overwrite: getattr overwritten inode %d: %s", file2Inode, st)
+		} else if st == 0 && overwritten.Parent <= TrashInode {
+			t.Fatalf("Test trash overwrite: overwritten inode %d should be moved to trash or deleted, parent=%d", file2Inode, overwritten.Parent)
+		}
+		if st := m.Unlink(ctx, dir1, "trash_file2"); st != 0 {
+			t.Fatalf("cleanup trash_file2: %s", st)
+		}
+		assertInodes(t, m, "Test trash overwrite cleanup dir1", dir1, 0)
+		t.Logf("Test trash overwrite passed")
+	}
+
+	// Test cross-directory overwrite with trash enabled
+	{
+		assertInodes(t, m, "Test trash cross-dir pre-condition dir1", dir1, 0)
+		assertInodes(t, m, "Test trash cross-dir pre-condition dir2", dir2, 0)
+		if st := m.Create(ctx, dir1, "cross_trash1", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create cross_trash1: %s", st)
+		}
+		if st := m.Create(ctx, dir2, "cross_trash2", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create cross_trash2: %s", st)
+		}
+		assertInodes(t, m, "Test trash cross-dir after create dir1", dir1, 1)
+		assertInodes(t, m, "Test trash cross-dir after create dir2", dir2, 1)
+		if st := m.Rename(ctx, dir1, "cross_trash1", dir2, "cross_trash2", 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename cross_trash1 to cross_trash2 (overwrite with trash): %s", st)
+		}
+		assertInodes(t, m, "Test trash cross-dir dir1", dir1, 0)
+		assertInodes(t, m, "Test trash cross-dir dir2", dir2, 1)
+		overwritten := Attr{}
+		if st := m.GetAttr(ctx, file2Inode, &overwritten); st != 0 && st != syscall.ENOENT {
+			t.Fatalf("Test trash cross-dir overwrite: getattr overwritten inode %d: %s", file2Inode, st)
+		} else if st == 0 && overwritten.Parent <= TrashInode {
+			t.Fatalf("Test trash cross-dir overwrite: overwritten inode %d should be moved to trash or deleted, parent=%d", file2Inode, overwritten.Parent)
+		}
+		if st := m.Unlink(ctx, dir2, "cross_trash2"); st != 0 {
+			t.Fatalf("cleanup cross_trash2: %s", st)
+		}
+		assertInodes(t, m, "Test trash cross-dir cleanup dir2", dir2, 0)
+		t.Logf("Test trash cross-dir overwrite passed")
+	}
+
+	// Test exchange with trash enabled
+	{
+		assertInodes(t, m, "Test trash exchange pre-condition dir1", dir1, 0)
+		assertInodes(t, m, "Test trash exchange pre-condition dir2", dir2, 0)
+		if st := m.Create(ctx, dir1, "ex_trash1", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create ex_trash1: %s", st)
+		}
+		if st := m.Create(ctx, dir2, "ex_trash2", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create ex_trash2: %s", st)
+		}
+		assertInodes(t, m, "Test trash exchange after create dir1", dir1, 1)
+		assertInodes(t, m, "Test trash exchange after create dir2", dir2, 1)
+		if st := m.Rename(ctx, dir1, "ex_trash1", dir2, "ex_trash2", RenameExchange, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename exchange with trash: %s", st)
+		}
+		assertInodes(t, m, "Test trash exchange dir1", dir1, 1)
+		assertInodes(t, m, "Test trash exchange dir2", dir2, 1)
+		if st := m.Unlink(ctx, dir1, "ex_trash1"); st != 0 {
+			t.Fatalf("cleanup ex_trash1: %s", st)
+		}
+		if st := m.Unlink(ctx, dir2, "ex_trash2"); st != 0 {
+			t.Fatalf("cleanup ex_trash2: %s", st)
+		}
+		assertInodes(t, m, "Test trash exchange cleanup dir1", dir1, 0)
+		assertInodes(t, m, "Test trash exchange cleanup dir2", dir2, 0)
+		t.Logf("Test trash exchange passed")
+	}
+
+	// Test 7: Restore from trash with overwrite
+	{
+		if st := m.Create(ctx, dir1, "to_trash", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create to_trash: %s", st)
+		}
+		var trashInode Ino
+		if st := m.GetAttr(ctx, file1Inode, &attr); st != 0 {
+			t.Fatalf("getattr to_trash: %s", st)
+		}
+		if st := m.Create(ctx, dir2, "victim", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create victim: %s", st)
+		}
+		m.FlushSession()
+		if st := m.Unlink(ctx, dir1, "to_trash"); st != 0 {
+			t.Fatalf("unlink to_trash: %s", st)
+		}
+		time.Sleep(500 * time.Millisecond)
+		m.FlushSession()
+		if !trashInode.IsTrash() {
+			trashInode = file1Inode
+		}
+		assertInodes(t, m, "Test 7 before rename dir1", dir1, 0)
+		assertInodes(t, m, "Test 7 before rename dir2", dir2, 1)
+		st := m.Rename(ctx, dir1, "to_trash", dir2, "victim", 0, &trashInode, &attr)
+		if st == 0 {
+			m.FlushSession()
+			assertInodes(t, m, "Test 7 after rename dir1", dir1, 0)
+			assertInodes(t, m, "Test 7 after rename dir2", dir2, 1)
+			t.Logf("Test 7 passed: restore from trash with overwrite")
+		} else {
+			t.Logf("Test 7 skipped: rename from trash not allowed (expected for security)")
+		}
+		if st := m.Unlink(ctx, dir2, "victim"); st != 0 && st != syscall.ENOENT {
+			t.Fatalf("cleanup victim: %s", st)
+		}
+		assertInodes(t, m, "Test 7 cleanup dir2", dir2, 0)
+	}
+
+	// Test 8: Same-dir exchange with trash enabled
+	{
+		assertInodes(t, m, "Test 8 pre-condition dir1", dir1, 0)
+		if st := m.Create(ctx, dir1, "trash_a", 0644, 022, 0, &file1Inode, &attr); st != 0 {
+			t.Fatalf("create trash_a: %s", st)
+		}
+		if st := m.Create(ctx, dir1, "trash_b", 0644, 022, 0, &file2Inode, &attr); st != 0 {
+			t.Fatalf("create trash_b: %s", st)
+		}
+		assertInodes(t, m, "Test 8 after creates dir1", dir1, 2)
+		if st := m.Rename(ctx, dir1, "trash_a", dir1, "trash_b", RenameExchange, &file1Inode, &attr); st != 0 {
+			t.Fatalf("rename same-dir exchange with trash: %s", st)
+		}
+		assertInodes(t, m, "Test 8 same-dir exchange", dir1, 2)
+		if st := m.Unlink(ctx, dir1, "trash_b"); st != 0 {
+			t.Fatalf("cleanup trash_b: %s", st)
+		}
+		if st := m.Unlink(ctx, dir1, "trash_a"); st != 0 {
+			t.Fatalf("cleanup trash_a: %s", st)
+		}
+		assertInodes(t, m, "Test 8 cleanup dir1", dir1, 0)
+		t.Logf("Test 8 passed: same-dir exchange with trash")
+	}
 }
 
 func testBatchClone(t *testing.T, m Meta) {
@@ -3046,11 +3593,6 @@ func testBatchClone(t *testing.T, m Meta) {
 	// --- test 1: successful batch clone ---
 	var count uint64
 	st := m.getBase().BatchClone(ctx, srcDir, dstDir, nonDirEntries, 0, 022, &count)
-	if st == syscall.ENOTSUP {
-		m.Remove(ctx, RootInode, "batchSrc", false, RmrDefaultThreads, nil)
-		m.Remove(ctx, RootInode, "batchDst", false, RmrDefaultThreads, nil)
-		return
-	}
 
 	if st != 0 {
 		t.Fatalf("BatchClone: %s", st)
@@ -3576,6 +4118,8 @@ func testQuota(t *testing.T, m Meta) {
 	ctx := Background()
 	var inode, parent Ino
 	var attr Attr
+
+	_ = m.Remove(ctx, RootInode, "quota", true, 10, nil)
 	if st := m.Mkdir(ctx, RootInode, "quota", 0755, 0, 0, &parent, &attr); st != 0 {
 		t.Fatalf("Mkdir quota: %s", st)
 	}
@@ -4781,8 +5325,7 @@ func testQuotaUsageStatistics(t *testing.T, m Meta, ctx Context, parent Ino, uid
 	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set group quota for gid %d: %s", gid, err)
 	}
-
-	time.Sleep(time.Second * 2)
+	m.getBase().doFlushQuotas()
 
 	qs := make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -4855,6 +5398,14 @@ func testUserGroupQuota(t *testing.T, m Meta) {
 		testBatchUnlinkWithUserGroupQuota(t, m, ctx, parent, uid, gid)
 	})
 
+	t.Run("SustainedInodeQuotaDecrement", func(t *testing.T) {
+		testSustainedInodeQuotaDecrement(t, m, ctx, parent, uid, gid)
+	})
+
+	t.Run("SustainedInodeBeforeQuotaEnabled", func(t *testing.T) {
+		testSustainedInodeBeforeQuotaEnabled(t, m, ctx, parent, uid, gid)
+	})
+
 	cleanupQuotaTest(ctx, m, parent, uid, gid)
 
 }
@@ -4900,7 +5451,6 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(100 * time.Millisecond)
 
 	qs := make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -4925,7 +5475,6 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(100 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -4977,7 +5526,6 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(100 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5031,6 +5579,155 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	m.HandleQuota(ctx, QuotaDel, parentPath, DirQuotaType, nil, false, false, false)
 }
 
+func testSustainedInodeQuotaDecrement(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid uint32) {
+	format := m.getBase().getFormat()
+	format.UserGroupQuota = true
+	uidKey := fmt.Sprintf("%d", uid)
+	gidKey := fmt.Sprintf("%d", gid)
+	if err := m.HandleQuota(ctx, QuotaSet, uidKey, UserQuotaType, map[string]*Quota{uidKey: {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+		t.Fatalf("Set user quota: %s", err)
+	}
+	if err := m.HandleQuota(ctx, QuotaSet, gidKey, GroupQuotaType, map[string]*Quota{gidKey: {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+		t.Fatalf("Set group quota: %s", err)
+	}
+	m.getBase().loadQuotas()
+
+	getUsedInodes := func(qtype uint32, key string) int64 {
+		m.getBase().doFlushQuotas()
+		qs := make(map[string]*Quota)
+		if err := m.HandleQuota(ctx, QuotaGet, key, qtype, qs, false, false, false); err != nil {
+			t.Fatalf("Get quota %d/%s: %s", qtype, key, err)
+		}
+		q := qs[key]
+		if q == nil {
+			t.Fatalf("quota %d/%s not found", qtype, key)
+		}
+		return q.UsedInodes
+	}
+
+	uidBefore := getUsedInodes(UserQuotaType, uidKey)
+	gidBefore := getUsedInodes(GroupQuotaType, gidKey)
+
+	ownerCtx := &testContext{Context: context.Background(), uid: uid, gid: gid}
+	var inode Ino
+	var attr Attr
+	if st := m.Create(ownerCtx, parent, "sustained_inode_quota_file", 0644, 0, 0, &inode, &attr); st != 0 {
+		t.Fatalf("Create sustained file: %s", st)
+	}
+
+	uidAfterCreate := getUsedInodes(UserQuotaType, uidKey)
+	gidAfterCreate := getUsedInodes(GroupQuotaType, gidKey)
+	if uidAfterCreate != uidBefore+1 {
+		t.Fatalf("user quota inode should increase by 1 after create: before=%d after=%d", uidBefore, uidAfterCreate)
+	}
+	if gidAfterCreate != gidBefore+1 {
+		t.Fatalf("group quota inode should increase by 1 after create: before=%d after=%d", gidBefore, gidAfterCreate)
+	}
+
+	if st := m.Unlink(ctx, parent, "sustained_inode_quota_file", true); st != 0 {
+		t.Fatalf("Unlink sustained file: %s", st)
+	}
+
+	uidAfterUnlink := getUsedInodes(UserQuotaType, uidKey)
+	gidAfterUnlink := getUsedInodes(GroupQuotaType, gidKey)
+	if uidAfterUnlink != uidBefore+1 {
+		t.Fatalf("user quota inode should remain increased after unlink (sustained): before=%d after_unlink=%d", uidBefore, uidAfterUnlink)
+	}
+	if gidAfterUnlink != gidBefore+1 {
+		t.Fatalf("group quota inode should remain increased after unlink (sustained): before=%d after_unlink=%d", gidBefore, gidAfterUnlink)
+	}
+
+	if st := m.Close(ctx, inode); st != 0 {
+		t.Fatalf("Close sustained file: %s", st)
+	}
+
+	uidAfterDelete := getUsedInodes(UserQuotaType, uidKey)
+	gidAfterDelete := getUsedInodes(GroupQuotaType, gidKey)
+	if uidAfterDelete != uidBefore {
+		t.Fatalf("user quota inode should return to baseline after sustained delete: before=%d after=%d", uidBefore, uidAfterDelete)
+	}
+	if gidAfterDelete != gidBefore {
+		t.Fatalf("group quota inode should return to baseline after sustained delete: before=%d after=%d", gidBefore, gidAfterDelete)
+	}
+
+	m.HandleQuota(ctx, QuotaDel, uidKey, UserQuotaType, nil, false, false, false)
+	m.HandleQuota(ctx, QuotaDel, gidKey, GroupQuotaType, nil, false, false, false)
+}
+
+// testSustainedInodeBeforeQuotaEnabled is a regression test for #7079.
+// A sustained inode created before UserGroupQuota is enabled must be counted by
+// the initial scan, otherwise Close may drive usage negative.
+func testSustainedInodeBeforeQuotaEnabled(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid uint32) {
+	quotaUID := uint32(3001)
+	quotaGID := uint32(4001)
+	uidKey := fmt.Sprintf("%d", quotaUID)
+	gidKey := fmt.Sprintf("%d", quotaGID)
+	const emptyFileSpace = int64(1 << 12) // align4K(0)
+
+	format := m.getBase().getFormat()
+	format.UserGroupQuota = false
+	m.getBase().quotaMu.Lock()
+	m.getBase().userQuotas = make(map[uint64]*Quota)
+	m.getBase().groupQuotas = make(map[uint64]*Quota)
+	m.getBase().quotaMu.Unlock()
+
+	var inode Ino
+	var attr Attr
+	if st := m.Create(ctx, parent, "pre_quota_sustained_file", 0644, 0, 0, &inode, &attr); st != 0 {
+		t.Fatalf("Create pre_quota_sustained_file: %s", st)
+	}
+	if st := m.SetAttr(ctx, inode, SetAttrUID|SetAttrGID, 0, &Attr{Uid: quotaUID, Gid: quotaGID}); st != 0 {
+		t.Fatalf("SetAttr pre_quota_sustained_file owner: %s", st)
+	}
+
+	if st := m.Unlink(ctx, parent, "pre_quota_sustained_file", true); st != 0 {
+		t.Fatalf("Unlink pre_quota_sustained_file: %s", st)
+	}
+
+	if err := m.HandleQuota(ctx, QuotaSet, uidKey, UserQuotaType, map[string]*Quota{uidKey: {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+		t.Fatalf("Set user quota: %s", err)
+	}
+	if err := m.HandleQuota(ctx, QuotaSet, gidKey, GroupQuotaType, map[string]*Quota{gidKey: {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+		t.Fatalf("Set group quota: %s", err)
+	}
+	m.getBase().loadQuotas()
+
+	getUsage := func(qtype uint32, key string) (int64, int64) {
+		m.getBase().doFlushQuotas()
+		qs := make(map[string]*Quota)
+		if err := m.HandleQuota(ctx, QuotaGet, key, qtype, qs, false, false, false); err != nil {
+			t.Fatalf("Get quota %d/%s: %s", qtype, key, err)
+		}
+		q := qs[key]
+		if q == nil {
+			t.Fatalf("quota %d/%s not found", qtype, key)
+		}
+		return q.UsedInodes, q.UsedSpace
+	}
+
+	// Scan result should include the one sustained inode.
+	if inodes, space := getUsage(UserQuotaType, uidKey); inodes != 1 || space != emptyFileSpace {
+		t.Fatalf("user quota after scan should be 1 inode / %d bytes: got UsedInodes=%d UsedSpace=%d", emptyFileSpace, inodes, space)
+	}
+	if inodes, space := getUsage(GroupQuotaType, gidKey); inodes != 1 || space != emptyFileSpace {
+		t.Fatalf("group quota after scan should be 1 inode / %d bytes: got UsedInodes=%d UsedSpace=%d", emptyFileSpace, inodes, space)
+	}
+
+	if st := m.Close(ctx, inode); st != 0 {
+		t.Fatalf("Close pre_quota_sustained_file: %s", st)
+	}
+
+	if inodes, space := getUsage(UserQuotaType, uidKey); inodes != 0 || space != 0 {
+		t.Fatalf("user quota after close should be empty: got UsedInodes=%d UsedSpace=%d, want 0/0", inodes, space)
+	}
+	if inodes, space := getUsage(GroupQuotaType, gidKey); inodes != 0 || space != 0 {
+		t.Fatalf("group quota after close should be empty: got UsedInodes=%d UsedSpace=%d, want 0/0", inodes, space)
+	}
+
+	m.HandleQuota(ctx, QuotaDel, uidKey, UserQuotaType, nil, false, false, false)
+	m.HandleQuota(ctx, QuotaDel, gidKey, GroupQuotaType, nil, false, false, false)
+}
+
 func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid uint32) {
 	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
 		t.Fatalf("Set user quota: %s", err)
@@ -5067,7 +5764,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs := make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5101,7 +5797,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5153,7 +5848,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5198,7 +5892,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5261,7 +5954,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5305,7 +5997,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5376,7 +6067,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5410,7 +6100,6 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 
 	m.getBase().doFlushQuotas()
-	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("%d", uid), UserQuotaType, qs, false, false, false); err != nil {
@@ -5447,5 +6136,35 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 	if err := m.HandleQuota(ctx, QuotaDel, fmt.Sprintf("%d", gid), GroupQuotaType, nil, false, false, false); err != nil {
 		t.Fatalf("Delete group quota: %s", err)
+	}
+}
+
+// fuseDefaultCtx simulates FUSE default mode (NonDefaultPermission=false):
+// Gids() only returns the primary group and CheckPermission() returns false.
+type fuseDefaultCtx struct {
+	context.Context
+	pid uint32
+	uid uint32
+	gid uint32
+}
+
+func (c *fuseDefaultCtx) Uid() uint32           { return c.uid }
+func (c *fuseDefaultCtx) Gid() uint32           { return c.gid }
+func (c *fuseDefaultCtx) Gids() []uint32        { return []uint32{c.gid} }
+func (c *fuseDefaultCtx) Pid() uint32           { return c.pid }
+func (c *fuseDefaultCtx) Cancel()               {}
+func (c *fuseDefaultCtx) Canceled() bool        { return false }
+func (c *fuseDefaultCtx) CheckPermission() bool { return false }
+func (c *fuseDefaultCtx) WithValue(k, v interface{}) Context {
+	cp := *c
+	cp.Context = context.WithValue(c.Context, k, v)
+	return &cp
+}
+
+func newFuseDefaultCtx(uid, primaryGid uint32) *fuseDefaultCtx {
+	return &fuseDefaultCtx{
+		Context: context.Background(),
+		uid:     uid,
+		gid:     primaryGid,
 	}
 }

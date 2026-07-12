@@ -80,6 +80,8 @@ func addCategory(f cli.Flag, cat string) {
 		ff.Category = cat
 	case *cli.Float64Flag:
 		ff.Category = cat
+	case *cli.DurationFlag:
+		ff.Category = cat
 	case *cli.StringSliceFlag:
 		ff.Category = cat
 	default:
@@ -107,6 +109,10 @@ func storageFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "storage-class",
 			Usage: "the storage class for data written by current client",
+		},
+		&cli.StringFlag{
+			Name:  "tag",
+			Usage: "custom tag when uploading object storage (e.g. --tag key=value)",
 		},
 		&cli.StringFlag{
 			Name:  "get-timeout",
