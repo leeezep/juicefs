@@ -1,0 +1,60 @@
+name: python-sdk-wheel-macos-arm64-py311
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify quota pipeline fix
+        run: git merge-base --is-ancestor df88ff5760de87118ff070d6c965f2351ffa9791 HEAD
+        shell: bash
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          allow-prereleases: true
+
+      - name: Verify runner architecture
+        run: |
+          test "$(uname -m)" = "arm64"
+          python -c "import platform; print(platform.platform()); print(platform.machine())"
+        shell: bash
+
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip build
+        shell: bash
+
+      - name: Build native library (libjfs.dylib)
+        run: |
+          cd sdk/python
+          go build -buildmode c-shared -ldflags="-s -w" -o juicefs/juicefs/libjfs.dylib ../java/libjfs
+          file juicefs/juicefs/libjfs.dylib
+        shell: bash
+
+      - name: Build wheel
+        run: |
+          cd sdk/python/juicefs
+          python -m build -w
+          ls -al dist
+        shell: bash
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: juicefs-wheel-macos-arm64-py311
+          path: sdk/python/juicefs/dist/*.whl
