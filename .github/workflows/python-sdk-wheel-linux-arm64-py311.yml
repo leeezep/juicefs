@@ -10,6 +10,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify quota pipeline fix
+        run: git merge-base --is-ancestor ae075a0e538245d3d4f0ea7090b115ee43186155 HEAD
+        shell: bash
 
       - name: Setup Go
         uses: actions/setup-go@v5
